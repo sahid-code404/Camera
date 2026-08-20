@@ -61,6 +61,7 @@ internal class ComputationalRawCaptureCoordinator(
         captureCharacteristics: CameraCharacteristics,
         latestPreviewResult: TotalCaptureResult?,
         settings: PhotoLensSettings,
+        targetAspect: Float,
         onAcquisitionFinished: () -> Unit,
         onProcessing: (Int) -> Unit,
         onSaved: (String) -> Unit,
@@ -93,6 +94,7 @@ internal class ComputationalRawCaptureCoordinator(
             lens = lens,
             characteristics = captureCharacteristics,
             settings = settings,
+            targetAspect = targetAspect.takeIf { it.isFinite() && it > 0f } ?: 4f / 3f,
             reader = reader,
             onAcquisitionFinished = onAcquisitionFinished,
             onProcessing = onProcessing,
@@ -336,6 +338,7 @@ internal class ComputationalRawCaptureCoordinator(
                     frames = frames,
                     characteristics = state.characteristics,
                     settings = state.settings,
+                    targetAspect = state.targetAspect,
                     outputDirectory = scratchDir,
                 )
                 try {
@@ -346,6 +349,7 @@ internal class ComputationalRawCaptureCoordinator(
                         append(" · saturation=${state.settings.saturation ?: 1f}")
                         append(" · sharpness=${state.settings.sharpness ?: 0.28f}")
                         append(" · upscale=${state.settings.upscaleFactor ?: 1f}x")
+                        append(" · aspect=${state.targetAspect}")
                     }
                     val uri = FusedDngWriter.save(
                         context = appContext,
@@ -439,6 +443,7 @@ internal class ComputationalRawCaptureCoordinator(
         val lens: ValuableLens,
         val characteristics: CameraCharacteristics,
         val settings: PhotoLensSettings,
+        val targetAspect: Float,
         val reader: ImageReader,
         val onAcquisitionFinished: () -> Unit,
         val onProcessing: (Int) -> Unit,
