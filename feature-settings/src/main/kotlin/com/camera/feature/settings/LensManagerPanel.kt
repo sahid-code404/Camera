@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -35,11 +36,13 @@ import androidx.compose.ui.unit.sp
 import com.camera.core.model.LensFacing
 import com.camera.core.model.LensRole
 import com.camera.core.model.LensUserConfig
+import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
 import com.camera.core.model.ZoomLabel
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
-/** First working Lens Manager. Advanced per-lens photo/video tuning is layered onto this later. */
+/** Lens layout + per-lens computational DNG tuning. */
 @Composable
 fun LensManagerPanel(
     lenses: List<ValuableLens>,
@@ -91,7 +94,7 @@ fun LensManagerPanel(
             }
 
             Text(
-                "Choose which cameras appear, their order, role, name, and the exact zoom label shown on the camera screen.",
+                "Choose visible cameras, order, zoom labels, and independent DNG processing for every lens.",
                 color = Color.White.copy(alpha = 0.58f),
                 fontSize = 12.sp,
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
@@ -200,7 +203,7 @@ private fun LensConfigCard(
             modifier = Modifier.fillMaxWidth(),
             label = { Text("Custom zoom label") },
             supportingText = {
-                Text("Examples: 0.6×, 1×, 35mm, MAIN, TELE. Label never changes optical zoom math.")
+                Text("0.6×, 1×, 35mm, MAIN, TELE — presentation only, never optical math.")
             },
             singleLine = true,
         )
@@ -234,6 +237,21 @@ private fun LensConfigCard(
             TextButton(onClick = { onMove(1) }, enabled = canMoveDown) { Text("↓") }
         }
 
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+
+        if (lens.rawSupported) {
+            DngProcessingControls(
+                photo = config.photo,
+                onChange = { photo -> onChange(config.copy(photo = photo)) },
+            )
+        } else {
+            Text(
+                "DNG photo unavailable: this route exposes no RAW_SENSOR stream. It can still remain available for other modes such as video when supported.",
+                color = Color(0xFFFFB4AB),
+                fontSize = 11.sp,
+            )
+        }
+
         if (!canHide && config.visible) {
             Text(
                 "At least one ${lens.facing.name.lowercase()} camera must stay visible.",
@@ -242,6 +260,116 @@ private fun LensConfigCard(
             )
         }
     }
+}
+
+@Composable
+private fun DngProcessingControls(
+    photo: PhotoLensSettings,
+    onChange: (PhotoLensSettings) -> Unit,
+) {
+    Text(
+        "Computational DNG",
+        color = Color.White,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 14.sp,
+    )
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("HDR", color = Color.White, fontSize = 13.sp)
+            Text(
+                "Bracket + native C++ fusion",
+                color = Color.White.copy(alpha = 0.45f),
+                fontSize = 10.sp,
+            )
+        }
+        Switch(
+            checked = photo.hdrEnabled ?: true,
+            onCheckedChange = { onChange(photo.copy(hdrEnabled = it)) },
+        )
+    }
+
+    FloatControl(
+        label = "HDR strength",
+        value = photo.hdrStrength ?: 0.72f,
+        range = 0f..2f,
+        onValueChange = { onChange(photo.copy(hdrStrength = it)) },
+    )
+    FloatControl(
+        label = "Highlights",
+        value = photo.highlightProtection ?: 0.55f,
+        range = 0f..2f,
+        onValueChange = { onChange(photo.copy(highlightProtection = it)) },
+    )
+    FloatControl(
+        label = "Shadows",
+        value = photo.shadowRecovery ?: 0.18f,
+        range = 0f..2f,
+        onValueChange = { onChange(photo.copy(shadowRecovery = it)) },
+    )
+    FloatControl(
+        label = "Denoise",
+        value = photo.denoise ?: 0.40f,
+        range = 0f..2f,
+        onValueChange = { onChange(photo.copy(denoise = it)) },
+    )
+    FloatControl(
+        label = "Saturation",
+        value = photo.saturation ?: 1f,
+        range = 0f..2.5f,
+        onValueChange = { onChange(photo.copy(saturation = it)) },
+    )
+    FloatControl(
+        label = "Sharpness",
+        value = photo.sharpness ?: 0.28f,
+        range = 0f..2f,
+        onValueChange = { onChange(photo.copy(sharpness = it)) },
+    )
+
+    val upscale = (photo.upscaleFactor ?: 1f).roundToInt().coerceIn(1, 4)
+    Text(
+        "DNG upscale ${upscale}×",
+        color = Color.White,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Medium,
+    )
+    Slider(
+        value = upscale.toFloat(),
+        onValueChange = {
+            onChange(photo.copy(upscaleFactor = it.roundToInt().coerceIn(1, 4).toFloat()))
+        },
+        valueRange = 1f..4f,
+        steps = 2,
+    )
+    Text(
+        "Bayer-preserving native upscale. 1× keeps native dimensions; higher factors are experimental until validated on this device.",
+        color = Color.White.copy(alpha = 0.42f),
+        fontSize = 10.sp,
+    )
+}
+
+@Composable
+private fun FloatControl(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, color = Color.White, fontSize = 12.sp, modifier = Modifier.weight(1f))
+        Text("%.2f".format(value), color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp)
+    }
+    Slider(
+        value = value.coerceIn(range.start, range.endInclusive),
+        onValueChange = onValueChange,
+        valueRange = range,
+    )
 }
 
 private fun canHide(
@@ -289,7 +417,7 @@ private fun LensRole.pretty(): String = name
 private fun metadataSummary(lens: ValuableLens): String {
     val focal = lens.focalLengthMm?.let { "%.2f mm".format(it) } ?: "focal ?"
     val sensor = lens.sensorWidthMm?.let { "%.2f mm sensor".format(it) } ?: "sensor ?"
-    val raw = if (lens.rawSupported) "RAW" else "processed"
+    val raw = if (lens.rawSupported) "DNG RAW" else "no RAW"
     val physical = lens.physicalCameraId?.let { "physical $it" } ?: "direct ${lens.cameraId}"
     return "$focal · $sensor · $raw · $physical"
 }
