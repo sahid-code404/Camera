@@ -27,17 +27,12 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Camera2 preview owner for the live camera screen.
+ * Owns one Camera2 preview session at a time.
  *
- * It owns exactly one CameraDevice/CameraCaptureSession at a time, can route a preview Surface to a
- * public physical member, and chooses a high quality preview buffer for the requested composition.
- * Square composition deliberately crops a normal sensor-ratio stream instead of selecting tiny
- * vendor 1:1 streams, which prevents the soft/blurry square preview seen on some Xiaomi/QTI HALs.
- *
- * Camera ownership is also treated as transient. If another higher-priority camera client takes the
- * device, this controller releases stale resources and reopens when CameraManager reports the camera
- * available again. Window-focus loss closes the camera proactively so normal app switching does not
- * leave a frozen TextureView behind.
+ * Square composition crops a sharp native-aspect stream instead of requesting tiny OEM 1:1
+ * streams. Camera loss is recoverable: the controller releases the stale device and reopens it when
+ * Android reports the camera available again. Front preview is intentionally NOT mirrored so the
+ * viewfinder matches the scene/captured orientation.
  */
 internal class Camera2PreviewController(
     context: Context,
@@ -67,9 +62,6 @@ internal class Camera2PreviewController(
             if (hasFocus) {
                 reopenIfPossible()
             } else {
-                // A camera app should not keep the device while its window is no longer active.
-                // Closing here also prevents the last TextureView frame from looking permanently
-                // frozen when another camera app is launched.
                 closeCamera()
                 emit(PreviewState.Idle)
             }
@@ -79,7 +71,7 @@ internal class Camera2PreviewController(
     private val availabilityCallback = object : CameraManager.AvailabilityCallback() {
         override fun onCameraAvailable(cameraId: String) {
             val lens = pendingLens ?: return
-            if (lens.cameraId != cameraId || released) return
+            if (released || lens.cameraId != cameraId) return
             reopenIfPossible()
         }
 
@@ -106,6 +98,7 @@ internal class Camera2PreviewController(
         targetAspect: Float? = 4f / 3f,
     ) {
         if (released) return
+
         textureView = view
         pendingLens = lens
         pendingAspect = targetAspect
@@ -197,8 +190,8 @@ internal class Camera2PreviewController(
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
         if (!view.isAttachedToWindow || !view.hasWindowFocus()) return
-        val key = lensKey(lens, targetAspect)
 
+        val key = lensKey(lens, targetAspect)
         if (key == activeLensKey && (opening || cameraDevice != null)) return
 
         closeCamera()
@@ -278,8 +271,6 @@ internal class Camera2PreviewController(
             pendingLens?.id == lens.id &&
             textureView?.hasWindowFocus() == true
         ) {
-            // Keep this as Opening rather than Error. CameraManager.AvailabilityCallback will reopen
-            // automatically when the competing camera client releases the device.
             emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
         } else {
             emit(PreviewState.Idle)
@@ -322,7 +313,7 @@ internal class Camera2PreviewController(
             val surface = Surface(texture)
             previewSurface = surface
             val output = OutputConfiguration(surface)
-            lens.physicalCameraId?.let { physicalId -> output.setPhysicalCameraId(physicalId) }
+            lens.physicalCameraId?.let(output::setPhysicalCameraId)
 
             val sessionConfig = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
@@ -422,20 +413,12 @@ internal class Camera2PreviewController(
         activeLensKey = null
     }
 
-    /**
-     * Select a preview stream for the composition without sacrificing sharpness.
-     *
-     * 1:1 is a composition crop, not a reason to request a native square Camera2 stream. A number
-     * of OEM HALs expose square PRIVATE sizes only at low resolution (for example 640x640), which
-     * looks visibly soft once stretched across a modern display. For square mode we therefore use
-     * the sensor's normal aspect (typically 4:3), prefer >= ~1 MP, and crop to 1:1 in the TextureView.
-     */
     private fun choosePreviewSize(
         characteristics: CameraCharacteristics,
         targetAspect: Float?,
     ): Size {
-        val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val sizes = streamMap
+        val sizes = characteristics
+            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(SurfaceTexture::class.java)
             ?.filter { it.width > 0 && it.height > 0 }
             ?.distinctBy { "${it.width}x${it.height}" }
@@ -517,9 +500,6 @@ internal class Camera2PreviewController(
             Surface.ROTATION_180 -> matrix.postRotate(180f, centerX, centerY)
         }
 
-        // Correct TextureView's implicit stretch and center-crop the stream to the selected visible
-        // composition. In 1:1 this crops the high-resolution native sensor preview rather than
-        // enlarging a low-resolution square stream.
         if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180) {
             val sourceAspect = sizeAspect(size)
             val requested = targetAspect
@@ -534,10 +514,8 @@ internal class Camera2PreviewController(
             }
         }
 
-        val front = characteristics.get(CameraCharacteristics.LENS_FACING) ==
-            CameraCharacteristics.LENS_FACING_FRONT
-        if (front) matrix.postScale(-1f, 1f, centerX, centerY)
-
+        // Do not horizontally flip the front camera. Camera2 already provides sensor-oriented
+        // frames; applying a second flip here creates a mirrored viewfinder.
         view.setTransform(matrix)
     }
 
