@@ -46,13 +46,15 @@ internal class ComputationalRawCaptureCoordinator(
     private var active: BurstState? = null
 
     fun supports(characteristics: CameraCharacteristics): Boolean {
-        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-            ?: intArrayOf()
+        // Several Qualcomm/Xiaomi physical-camera characteristic blocks publish legitimate
+        // RAW_SENSOR output sizes but omit REQUEST_AVAILABLE_CAPABILITIES_RAW. The concrete stream
+        // map is the stronger routing signal, while createCaptureSession remains the final HAL
+        // validation. Never synthesize RAW from JPEG/YUV.
         val rawSizes = characteristics
             .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(ImageFormat.RAW_SENSOR)
             .orEmpty()
-        return capabilities.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) && rawSizes.isNotEmpty()
+        return rawSizes.isNotEmpty()
     }
 
     fun capture(
