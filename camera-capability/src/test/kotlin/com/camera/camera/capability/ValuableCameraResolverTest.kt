@@ -72,6 +72,60 @@ class ValuableCameraResolverTest {
     }
 
     @Test
+    fun rawPhysicalRouteWinsOverNonRawDirectAlias() {
+        val nonRawDirect = profile(
+            routeCameraId = "2",
+            facing = LensFacing.BACK,
+            focal = 2.2f,
+            sensorWidth = 5.8f,
+            supportsRaw = false,
+        )
+        val rawPhysical = profile(
+            routeCameraId = "0",
+            physicalCameraId = "2",
+            parent = "0",
+            facing = LensFacing.BACK,
+            focal = 2.2f,
+            sensorWidth = 5.8f,
+            supportsRaw = true,
+        )
+
+        val result = ValuableCameraResolver.resolve(listOf(nonRawDirect, rawPhysical))
+
+        assertEquals(1, result.lenses.size)
+        assertEquals("0", result.lenses.single().cameraId)
+        assertEquals("2", result.lenses.single().physicalCameraId)
+        assertTrue(result.lenses.single().rawSupported)
+        assertTrue("2:direct" in result.hiddenRouteKeys)
+    }
+
+    @Test
+    fun keepsRawLogicalRouteWhenChildrenCannotCaptureRaw() {
+        val logicalRaw = profile(
+            routeCameraId = "logical",
+            facing = LensFacing.BACK,
+            focal = 4.5f,
+            sensorWidth = 6.4f,
+            physicalIds = setOf("main"),
+            logical = true,
+            supportsRaw = true,
+        )
+        val nonRawChild = profile(
+            routeCameraId = "logical",
+            physicalCameraId = "main",
+            parent = "logical",
+            facing = LensFacing.BACK,
+            focal = 4.5f,
+            sensorWidth = 6.4f,
+            supportsRaw = false,
+        )
+
+        val result = ValuableCameraResolver.resolve(listOf(logicalRaw, nonRawChild))
+
+        assertTrue(result.lenses.any { it.cameraId == "logical" && it.physicalCameraId == null && it.rawSupported })
+    }
+
+    @Test
     fun duplicateDirectVendorAliasesWithSameOpticsCollapseToOneLens() {
         val preferred = profile(
             routeCameraId = "0",
