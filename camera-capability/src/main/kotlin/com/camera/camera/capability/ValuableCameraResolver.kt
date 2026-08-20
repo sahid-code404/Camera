@@ -11,6 +11,9 @@ import kotlin.math.roundToInt
 
 /**
  * Converts raw Camera2 routes into useful photographic lenses without relying on numeric camera IDs.
+ *
+ * When [validatedRouteKeys] is supplied, only routes that successfully configured a Camera2 session
+ * are eligible. A null set means metadata-only discovery and is intentionally weaker evidence.
  */
 object ValuableCameraResolver {
     data class Resolution(
@@ -18,7 +21,10 @@ object ValuableCameraResolver {
         val hiddenRouteKeys: Set<String>,
     )
 
-    fun resolve(profiles: List<CameraDeviceProfile>): Resolution {
+    fun resolve(
+        profiles: List<CameraDeviceProfile>,
+        validatedRouteKeys: Set<String>? = null,
+    ): Resolution {
         if (profiles.isEmpty()) return Resolution(emptyList(), emptySet())
 
         val enumeratedIds = profiles
@@ -34,7 +40,12 @@ object ValuableCameraResolver {
         val hidden = mutableSetOf<String>()
 
         deduplicated.groupBy { it.facing }.forEach { (facing, facingProfiles) ->
-            val photoProfiles = facingProfiles.filter(::isPhotographicRoute)
+            val photoProfiles = facingProfiles.filter { profile ->
+                val metadataEligible = isPhotographicRoute(profile)
+                val validationEligible = validatedRouteKeys == null || routeKey(profile) in validatedRouteKeys
+                if (!metadataEligible || !validationEligible) hidden += routeKey(profile)
+                metadataEligible && validationEligible
+            }
             val baseEquivalent = chooseBaseEquivalent(facing, photoProfiles)
 
             photoProfiles.forEach { profile ->
@@ -66,8 +77,6 @@ object ValuableCameraResolver {
                     rawSupported = profile.supportsRaw,
                 )
             }
-
-            facingProfiles.filterNot(::isPhotographicRoute).forEach { hidden += routeKey(it) }
         }
 
         val ordered = result.sortedWith(
