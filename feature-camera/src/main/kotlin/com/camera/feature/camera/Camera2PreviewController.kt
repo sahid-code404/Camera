@@ -1,8 +1,14 @@
 package com.camera.feature.camera
 
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
@@ -10,13 +16,24 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.ExifInterface
+import android.media.ImageReader
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Size
+import android.view.GestureDetector
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.TextureView
 import android.view.ViewTreeObserver
@@ -27,34 +44,72 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Owns one Camera2 preview session at a time.
+ * Camera2 owner for preview + the first real photo interactions.
  *
- * Square composition crops a sharp native-aspect stream instead of requesting tiny OEM 1:1
- * streams. Camera loss is recoverable: the controller releases the stale device and reopens it when
- * Android reports the camera available again. Front preview is intentionally NOT mirrored so the
- * viewfinder matches the scene/captured orientation.
+ * Preview remains deliberately lightweight and recoverable. Still capture temporarily swaps the
+ * preview session for a JPEG-only session, then restores preview. This avoids permanently adding a
+ * large JPEG Surface to the repeating session on vendor HALs that become unstable or change ISP
+ * behaviour when extra streams are always configured.
  */
 internal class Camera2PreviewController(
     context: Context,
     private val onState: (PreviewState) -> Unit,
+    private val onZoomState: (ZoomState) -> Unit = {},
+    private val onFocusPoint: (FocusPoint?) -> Unit = {},
+    private val onCaptureState: (PhotoCaptureState) -> Unit = {},
 ) {
     private val appContext = context.applicationContext
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
     private val thread = HandlerThread("Camera2Preview").apply { start() }
     private val handler = Handler(thread.looper)
+    private val saveThread = HandlerThread("CameraPhotoSave").apply { start() }
+    private val saveHandler = Handler(saveThread.looper)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executor { command -> handler.post(command) }
 
     private var textureView: TextureView? = null
     private var focusListenerView: TextureView? = null
+    private var gestureView: TextureView? = null
+    private var tapDetector: GestureDetector? = null
+    private var scaleDetector: ScaleGestureDetector? = null
+
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var previewSurface: Surface? = null
+    private var previewBuilder: CaptureRequest.Builder? = null
+    private var activeCharacteristics: CameraCharacteristics? = null
+    private var activePreviewSize: Size? = null
     private var activeLensKey: String? = null
     private var pendingLens: ValuableLens? = null
     private var pendingAspect: Float? = 4f / 3f
+
+    private var currentZoomRatio = 1f
+    private var maxZoomRatio = 1f
+    private var lastMeteringRegion: MeteringRectangle? = null
     private var opening = false
+    private var captureInFlight = false
     private var released = false
+    private var photoReader: ImageReader? = null
+    private var pendingPhoto: PendingPhoto? = null
+
+    private val clearFocusRunnable = Runnable {
+        val builder = previewBuilder ?: return@Runnable
+        val session = captureSession ?: return@Runnable
+        val characteristics = activeCharacteristics ?: return@Runnable
+        lastMeteringRegion = null
+        runCatching {
+            if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) > 0) {
+                builder.set(CaptureRequest.CONTROL_AF_REGIONS, null)
+            }
+            if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
+                builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+            }
+            setBestContinuousAf(builder, characteristics)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            session.setRepeatingRequest(builder.build(), null, handler)
+        }
+        emitFocus(null)
+    }
 
     private val windowFocusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
         handler.post {
@@ -103,6 +158,7 @@ internal class Camera2PreviewController(
         pendingLens = lens
         pendingAspect = targetAspect
         installWindowFocusListener(view)
+        installGestures(view)
 
         if (view.surfaceTextureListener !== surfaceListener) {
             view.surfaceTextureListener = surfaceListener
@@ -126,15 +182,76 @@ internal class Camera2PreviewController(
         }
     }
 
+    fun capturePhoto(targetAspect: Float? = pendingAspect) {
+        handler.post {
+            if (released || captureInFlight) return@post
+            val camera = cameraDevice ?: return@post
+            val lens = pendingLens ?: return@post
+            val view = textureView ?: return@post
+            if (!view.isAvailable || !view.hasWindowFocus()) return@post
+
+            val captureCharacteristics = captureCharacteristics(lens)
+            val size = chooseStillSize(captureCharacteristics)
+            val reader = ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 2)
+            photoReader = reader
+            captureInFlight = true
+            val orientation = jpegOrientation(captureCharacteristics, view.display?.rotation ?: Surface.ROTATION_0)
+            val photo = PendingPhoto(
+                aspect = targetAspect ?: 4f / 3f,
+                jpegOrientation = orientation,
+                width = size.width,
+                height = size.height,
+            )
+            pendingPhoto = photo
+            emitCapture(PhotoCaptureState.Capturing)
+
+            reader.setOnImageAvailableListener({ imageReader ->
+                val image = runCatching { imageReader.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
+                val bytes = try {
+                    val buffer = image.planes[0].buffer
+                    ByteArray(buffer.remaining()).also(buffer::get)
+                } finally {
+                    image.close()
+                }
+                val pending = pendingPhoto ?: photo
+                pendingPhoto = null
+                captureInFlight = false
+                emitCapture(PhotoCaptureState.Saving)
+                runCatching { imageReader.close() }
+                if (photoReader === imageReader) photoReader = null
+                saveHandler.post {
+                    runCatching {
+                        saveJpeg(bytes, pending.aspect, pending.jpegOrientation)
+                    }.onSuccess { uri ->
+                        emitCapture(PhotoCaptureState.Saved(uri))
+                    }.onFailure { error ->
+                        emitCapture(PhotoCaptureState.Error(error.message ?: "Photo save failed"))
+                    }
+                }
+            }, handler)
+
+            runCatching {
+                closePreviewSessionForCapture()
+                createStillSession(camera, lens, reader, captureCharacteristics, orientation)
+            }.onFailure { error ->
+                failCapture(error.message ?: "Unable to start photo capture")
+                restorePreviewIfPossible()
+            }
+        }
+    }
+
     fun release() {
         if (released) return
         released = true
         runCatching { cameraManager.unregisterAvailabilityCallback(availabilityCallback) }
+        handler.removeCallbacks(clearFocusRunnable)
         removeWindowFocusListener()
+        removeGestures()
         closeCamera()
         textureView?.surfaceTextureListener = null
         textureView = null
         thread.quitSafely()
+        saveThread.quitSafely()
     }
 
     private fun installWindowFocusListener(view: TextureView) {
@@ -149,11 +266,50 @@ internal class Camera2PreviewController(
     private fun removeWindowFocusListener() {
         val view = focusListenerView ?: return
         if (view.viewTreeObserver.isAlive) {
-            runCatching {
-                view.viewTreeObserver.removeOnWindowFocusChangeListener(windowFocusListener)
-            }
+            runCatching { view.viewTreeObserver.removeOnWindowFocusChangeListener(windowFocusListener) }
         }
         focusListenerView = null
+    }
+
+    private fun installGestures(view: TextureView) {
+        if (gestureView === view) return
+        removeGestures()
+        gestureView = view
+        tapDetector = GestureDetector(
+            view.context,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDown(e: MotionEvent): Boolean = true
+                override fun onSingleTapUp(e: MotionEvent): Boolean {
+                    val nx = (e.x / view.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                    val ny = (e.y / view.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+                    emitFocus(FocusPoint(nx, ny))
+                    handler.post { focusAt(e.x, e.y) }
+                    return true
+                }
+            },
+        )
+        scaleDetector = ScaleGestureDetector(
+            view.context,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    val factor = detector.scaleFactor
+                    if (factor.isFinite() && factor > 0f) handler.post { zoomBy(factor) }
+                    return true
+                }
+            },
+        )
+        view.setOnTouchListener { _, event ->
+            scaleDetector?.onTouchEvent(event)
+            tapDetector?.onTouchEvent(event)
+            true
+        }
+    }
+
+    private fun removeGestures() {
+        gestureView?.setOnTouchListener(null)
+        gestureView = null
+        tapDetector = null
+        scaleDetector = null
     }
 
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
@@ -162,9 +318,7 @@ internal class Camera2PreviewController(
         }
 
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-            pendingLens?.let { lens ->
-                configureTransform(lens, width, height, targetAspect = pendingAspect)
-            }
+            pendingLens?.let { lens -> configureTransform(lens, width, height, targetAspect = pendingAspect) }
         }
 
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -201,31 +355,24 @@ internal class Camera2PreviewController(
 
         runCatching {
             val characteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
+            activeCharacteristics = characteristics
+            configureZoomRange(characteristics)
             val size = choosePreviewSize(characteristics, targetAspect)
+            activePreviewSize = size
             texture.setDefaultBufferSize(size.width, size.height)
-            configureTransform(
-                lens = lens,
-                width = view.width,
-                height = view.height,
-                explicitSize = size,
-                targetAspect = targetAspect,
-            )
+            configureTransform(lens, view.width, view.height, explicitSize = size, targetAspect = targetAspect)
 
             cameraManager.openCamera(
                 lens.cameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         opening = false
-                        if (
-                            released ||
-                            activeLensKey != key ||
-                            textureView?.hasWindowFocus() != true
-                        ) {
+                        if (released || activeLensKey != key || textureView?.hasWindowFocus() != true) {
                             camera.close()
                             return
                         }
                         cameraDevice = camera
-                        createSession(camera, lens, texture, size)
+                        createPreviewSession(camera, lens, texture, size)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
@@ -249,11 +396,8 @@ internal class Camera2PreviewController(
         }.onFailure { error ->
             opening = false
             closeCamera()
-            if (isRecoverableOpenFailure(error)) {
-                markWaitingForCamera(lens)
-            } else {
-                emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
-            }
+            if (isRecoverableOpenFailure(error)) markWaitingForCamera(lens)
+            else emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
         }
     }
 
@@ -266,11 +410,7 @@ internal class Camera2PreviewController(
     }
 
     private fun markWaitingForCamera(lens: ValuableLens) {
-        if (
-            !released &&
-            pendingLens?.id == lens.id &&
-            textureView?.hasWindowFocus() == true
-        ) {
+        if (!released && pendingLens?.id == lens.id && textureView?.hasWindowFocus() == true) {
             emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
         } else {
             emit(PreviewState.Idle)
@@ -303,29 +443,23 @@ internal class Camera2PreviewController(
         }
     }
 
-    private fun createSession(
+    private fun createPreviewSession(
         camera: CameraDevice,
         lens: ValuableLens,
         texture: SurfaceTexture,
         previewSize: Size,
     ) {
         runCatching {
-            val surface = Surface(texture)
-            previewSurface = surface
+            val surface = previewSurface?.takeIf { it.isValid } ?: Surface(texture).also { previewSurface = it }
             val output = OutputConfiguration(surface)
             lens.physicalCameraId?.let(output::setPhysicalCameraId)
-
             val sessionConfig = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
                 listOf(output),
                 executor,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        if (
-                            cameraDevice !== camera ||
-                            released ||
-                            textureView?.hasWindowFocus() != true
-                        ) {
+                        if (cameraDevice !== camera || released || textureView?.hasWindowFocus() != true) {
                             session.close()
                             return
                         }
@@ -367,21 +501,16 @@ internal class Camera2PreviewController(
         previewSize: Size,
     ) {
         runCatching {
-            val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            val characteristics = activeCharacteristics ?: cameraManager.getCameraCharacteristics(lens.cameraId)
+            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                val characteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
-                val afModes = characteristics
-                    .get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-                    ?: intArrayOf()
-                when {
-                    afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
-                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                    afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) ->
-                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-                }
+                setBestContinuousAf(this, characteristics)
+                applyZoom(this, characteristics)
+                applyMetering(this, characteristics)
             }
-            session.setRepeatingRequest(request.build(), null, handler)
+            previewBuilder = builder
+            session.setRepeatingRequest(builder.build(), null, handler)
             emit(
                 PreviewState.Streaming(
                     cameraId = lens.cameraId,
@@ -400,17 +529,386 @@ internal class Camera2PreviewController(
         }
     }
 
+    private fun zoomBy(scaleFactor: Float) {
+        if (captureInFlight) return
+        val builder = previewBuilder ?: return
+        val session = captureSession ?: return
+        val characteristics = activeCharacteristics ?: return
+        val requested = (currentZoomRatio * scaleFactor).coerceIn(1f, maxZoomRatio)
+        if (abs(requested - currentZoomRatio) < 0.002f) return
+        currentZoomRatio = requested
+        runCatching {
+            applyZoom(builder, characteristics)
+            session.setRepeatingRequest(builder.build(), null, handler)
+        }.onSuccess {
+            emitZoom(ZoomState(currentZoomRatio, maxZoomRatio))
+        }.onFailure {
+            currentZoomRatio = currentZoomRatio.coerceIn(1f, maxZoomRatio)
+        }
+    }
+
+    private fun configureZoomRange(characteristics: CameraCharacteristics) {
+        val digitalMax = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        val ratioMax = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper
+        } else {
+            null
+        }
+        maxZoomRatio = max(1f, ratioMax ?: digitalMax).coerceAtMost(30f)
+        currentZoomRatio = 1f.coerceAtMost(maxZoomRatio)
+        emitZoom(ZoomState(currentZoomRatio, maxZoomRatio))
+    }
+
+    private fun applyZoom(builder: CaptureRequest.Builder, characteristics: CameraCharacteristics) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val range = characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            if (range != null) {
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoomRatio.coerceIn(max(1f, range.lower), range.upper))
+                return
+            }
+        }
+        builder.set(CaptureRequest.SCALER_CROP_REGION, zoomCrop(characteristics, currentZoomRatio))
+    }
+
+    private fun zoomCrop(characteristics: CameraCharacteristics, zoomRatio: Float): Rect? {
+        val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        val ratio = zoomRatio.coerceAtLeast(1f)
+        val width = (active.width() / ratio).toInt().coerceAtLeast(2)
+        val height = (active.height() / ratio).toInt().coerceAtLeast(2)
+        val left = active.left + (active.width() - width) / 2
+        val top = active.top + (active.height() - height) / 2
+        return Rect(left, top, left + width, top + height)
+    }
+
+    private fun focusAt(viewX: Float, viewY: Float) {
+        if (captureInFlight) return
+        val view = textureView ?: return
+        val session = captureSession ?: return
+        val builder = previewBuilder ?: return
+        val characteristics = activeCharacteristics ?: return
+        val crop = zoomCrop(characteristics, currentZoomRatio)
+            ?: characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: return
+        val (sx, sy) = mapViewPointToSensor(viewX, viewY, view, characteristics)
+        val centerX = crop.left + (sx * crop.width()).toInt()
+        val centerY = crop.top + (sy * crop.height()).toInt()
+        val boxW = max(80, (crop.width() * 0.12f).toInt())
+        val boxH = max(80, (crop.height() * 0.12f).toInt())
+        val regionRect = Rect(
+            (centerX - boxW / 2).coerceIn(crop.left, crop.right - 2),
+            (centerY - boxH / 2).coerceIn(crop.top, crop.bottom - 2),
+            (centerX + boxW / 2).coerceIn(crop.left + 1, crop.right),
+            (centerY + boxH / 2).coerceIn(crop.top + 1, crop.bottom),
+        )
+        if (regionRect.width() <= 0 || regionRect.height() <= 0) return
+        val region = MeteringRectangle(regionRect, MeteringRectangle.METERING_WEIGHT_MAX)
+        lastMeteringRegion = region
+
+        runCatching {
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), null, handler)
+            if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) > 0) {
+                builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+            }
+            if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
+                builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+            }
+            val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+            if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO)) {
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            }
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            session.capture(builder.build(), null, handler)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            session.setRepeatingRequest(builder.build(), null, handler)
+            handler.removeCallbacks(clearFocusRunnable)
+            handler.postDelayed(clearFocusRunnable, 2800L)
+        }
+    }
+
+    private fun mapViewPointToSensor(
+        x: Float,
+        y: Float,
+        view: TextureView,
+        characteristics: CameraCharacteristics,
+    ): Pair<Float, Float> {
+        val nx = (x / view.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+        val ny = (y / view.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+        val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val displayDegrees = rotationDegrees(view.display?.rotation ?: Surface.ROTATION_0)
+        return when ((sensorOrientation - displayDegrees + 360) % 360) {
+            90 -> ny to (1f - nx)
+            180 -> (1f - nx) to (1f - ny)
+            270 -> (1f - ny) to nx
+            else -> nx to ny
+        }
+    }
+
+    private fun applyMetering(builder: CaptureRequest.Builder, characteristics: CameraCharacteristics) {
+        val region = lastMeteringRegion ?: return
+        if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) > 0) {
+            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+        }
+        if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
+            builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+        }
+    }
+
+    private fun setBestContinuousAf(builder: CaptureRequest.Builder, characteristics: CameraCharacteristics) {
+        val modes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+        when {
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            modes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) ->
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+        }
+    }
+
+    private fun createStillSession(
+        camera: CameraDevice,
+        lens: ValuableLens,
+        reader: ImageReader,
+        captureCharacteristics: CameraCharacteristics,
+        orientation: Int,
+    ) {
+        val output = OutputConfiguration(reader.surface)
+        lens.physicalCameraId?.let(output::setPhysicalCameraId)
+        val config = SessionConfiguration(
+            SessionConfiguration.SESSION_REGULAR,
+            listOf(output),
+            executor,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    if (cameraDevice !== camera || released) {
+                        session.close()
+                        failCapture("Camera closed before capture")
+                        return
+                    }
+                    captureSession = session
+                    runCatching {
+                        val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                            addTarget(reader.surface)
+                            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                            setBestContinuousAf(this, captureCharacteristics)
+                            activeCharacteristics?.let { applyZoom(this, it) }
+                            applyMetering(this, captureCharacteristics)
+                            set(CaptureRequest.JPEG_ORIENTATION, orientation)
+                            set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+                        }
+                        session.capture(
+                            request.build(),
+                            object : CameraCaptureSession.CaptureCallback() {
+                                override fun onCaptureCompleted(
+                                    session: CameraCaptureSession,
+                                    request: CaptureRequest,
+                                    result: TotalCaptureResult,
+                                ) {
+                                    restorePreviewAfterStillSession(session)
+                                }
+
+                                override fun onCaptureFailed(
+                                    session: CameraCaptureSession,
+                                    request: CaptureRequest,
+                                    failure: CaptureFailure,
+                                ) {
+                                    failCapture("Photo capture failed (${failure.reason})")
+                                    restorePreviewAfterStillSession(session)
+                                }
+                            },
+                            handler,
+                        )
+                    }.onFailure { error ->
+                        failCapture(error.message ?: "Photo capture failed")
+                        restorePreviewAfterStillSession(session)
+                    }
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    session.close()
+                    failCapture("Still capture session rejected by camera")
+                    restorePreviewIfPossible()
+                }
+            },
+        )
+        camera.createCaptureSession(config)
+    }
+
+    private fun closePreviewSessionForCapture() {
+        handler.removeCallbacks(clearFocusRunnable)
+        runCatching { captureSession?.stopRepeating() }
+        runCatching { captureSession?.abortCaptures() }
+        runCatching { captureSession?.close() }
+        captureSession = null
+        previewBuilder = null
+    }
+
+    private fun restorePreviewAfterStillSession(stillSession: CameraCaptureSession) {
+        runCatching { stillSession.close() }
+        if (captureSession === stillSession) captureSession = null
+        restorePreviewIfPossible()
+    }
+
+    private fun restorePreviewIfPossible() {
+        if (released) return
+        val camera = cameraDevice ?: return
+        val lens = pendingLens ?: return
+        val view = textureView ?: return
+        val texture = view.surfaceTexture ?: return
+        val size = activePreviewSize ?: return
+        if (!view.isAvailable || !view.hasWindowFocus()) return
+        createPreviewSession(camera, lens, texture, size)
+    }
+
+    private fun failCapture(message: String) {
+        captureInFlight = false
+        pendingPhoto = null
+        runCatching { photoReader?.close() }
+        photoReader = null
+        emitCapture(PhotoCaptureState.Error(message))
+    }
+
+    private fun captureCharacteristics(lens: ValuableLens): CameraCharacteristics {
+        val physicalId = lens.physicalCameraId
+        if (physicalId != null) {
+            runCatching { cameraManager.getCameraCharacteristics(physicalId) }.getOrNull()?.let { return it }
+        }
+        return cameraManager.getCameraCharacteristics(lens.cameraId)
+    }
+
+    private fun chooseStillSize(characteristics: CameraCharacteristics): Size {
+        val sizes = characteristics
+            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(ImageFormat.JPEG)
+            ?.filter { it.width > 0 && it.height > 0 }
+            .orEmpty()
+        return sizes.maxByOrNull(::pixels) ?: Size(1920, 1080)
+    }
+
+    private fun jpegOrientation(characteristics: CameraCharacteristics, displayRotation: Int): Int {
+        val sensor = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val device = rotationDegrees(displayRotation)
+        val front = characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        val sign = if (front) 1 else -1
+        return (sensor + sign * device + 360) % 360
+    }
+
+    private fun saveJpeg(bytes: ByteArray, targetAspect: Float, orientation: Int): String {
+        val resolver = appContext.contentResolver
+        val name = "Camera_${System.currentTimeMillis()}.jpg"
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: error("Unable to create MediaStore image")
+        try {
+            resolver.openOutputStream(uri, "w")?.use { output ->
+                writeCroppedJpeg(bytes, targetAspect, output)
+            } ?: error("Unable to open photo output")
+
+            if (needsPostCrop(bytes, targetAspect)) {
+                runCatching {
+                    resolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
+                        val exif = ExifInterface(descriptor.fileDescriptor)
+                        exif.setAttribute(ExifInterface.TAG_ORIENTATION, exifOrientation(orientation).toString())
+                        exif.saveAttributes()
+                    }
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(
+                    uri,
+                    ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) },
+                    null,
+                    null,
+                )
+            }
+            return uri.toString()
+        } catch (error: Throwable) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw error
+        }
+    }
+
+    private fun writeCroppedJpeg(bytes: ByteArray, targetAspect: Float, output: java.io.OutputStream) {
+        val decoder = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false)
+        val crop = centerCropRect(decoder.width, decoder.height, targetAspect)
+        if (crop.width() == decoder.width && crop.height() == decoder.height) {
+            decoder.recycle()
+            output.write(bytes)
+            return
+        }
+        val bitmap = decoder.decodeRegion(
+            crop,
+            BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 },
+        ) ?: error("Unable to crop captured JPEG")
+        decoder.recycle()
+        try {
+            check(bitmap.compress(Bitmap.CompressFormat.JPEG, 96, output)) { "JPEG encode failed" }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun needsPostCrop(bytes: ByteArray, targetAspect: Float): Boolean {
+        val decoder = BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false)
+        return try {
+            val crop = centerCropRect(decoder.width, decoder.height, targetAspect)
+            crop.width() != decoder.width || crop.height() != decoder.height
+        } finally {
+            decoder.recycle()
+        }
+    }
+
+    private fun centerCropRect(width: Int, height: Int, targetAspect: Float): Rect {
+        val requestedLandscape = landscapeAspect(targetAspect.coerceAtLeast(0.1f))
+        val requested = if (width >= height) requestedLandscape else 1f / requestedLandscape
+        val source = width.toFloat() / height.coerceAtLeast(1).toFloat()
+        if (abs(source - requested) < 0.015f) return Rect(0, 0, width, height)
+        return if (source > requested) {
+            val newWidth = (height * requested).toInt().coerceIn(1, width)
+            val left = (width - newWidth) / 2
+            Rect(left, 0, left + newWidth, height)
+        } else {
+            val newHeight = (width / requested).toInt().coerceIn(1, height)
+            val top = (height - newHeight) / 2
+            Rect(0, top, width, top + newHeight)
+        }
+    }
+
+    private fun exifOrientation(degrees: Int): Int = when ((degrees % 360 + 360) % 360) {
+        90 -> ExifInterface.ORIENTATION_ROTATE_90
+        180 -> ExifInterface.ORIENTATION_ROTATE_180
+        270 -> ExifInterface.ORIENTATION_ROTATE_270
+        else -> ExifInterface.ORIENTATION_NORMAL
+    }
+
     private fun closeCamera() {
         opening = false
+        captureInFlight = false
+        handler.removeCallbacks(clearFocusRunnable)
         runCatching { captureSession?.stopRepeating() }
         runCatching { captureSession?.abortCaptures() }
         runCatching { captureSession?.close() }
         runCatching { cameraDevice?.close() }
         runCatching { previewSurface?.release() }
+        runCatching { photoReader?.close() }
         captureSession = null
         cameraDevice = null
         previewSurface = null
+        photoReader = null
+        previewBuilder = null
+        activeCharacteristics = null
+        activePreviewSize = null
         activeLensKey = null
+        lastMeteringRegion = null
+        pendingPhoto = null
+        emitFocus(null)
     }
 
     private fun choosePreviewSize(
@@ -425,13 +923,8 @@ internal class Camera2PreviewController(
             .orEmpty()
 
         val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-        val sensorAspect = active
-            ?.let { landscapeAspect(it.width().toFloat() / it.height().toFloat()) }
-            ?: 4f / 3f
-        val compositionAspect = targetAspect
-            ?.takeIf { it.isFinite() && it > 0f }
-            ?.let(::landscapeAspect)
-            ?: sensorAspect
+        val sensorAspect = active?.let { landscapeAspect(it.width().toFloat() / it.height().toFloat()) } ?: 4f / 3f
+        val compositionAspect = targetAspect?.takeIf { it.isFinite() && it > 0f }?.let(::landscapeAspect) ?: sensorAspect
         val squareComposition = abs(compositionAspect - 1f) < 0.03f
         val streamAspect = if (squareComposition) sensorAspect else compositionAspect
         val targetLongEdge = if (squareComposition) 1440 else 1280
@@ -454,11 +947,9 @@ internal class Camera2PreviewController(
         }
 
         return qualityCandidates.minWithOrNull(
-            compareBy<Size> {
-                abs(sizeAspect(it) - streamAspect)
-            }.thenBy {
-                abs(max(it.width, it.height) - targetLongEdge)
-            }.thenByDescending(::pixels),
+            compareBy<Size> { abs(sizeAspect(it) - streamAspect) }
+                .thenBy { abs(max(it.width, it.height) - targetLongEdge) }
+                .thenByDescending(::pixels),
         ) ?: sizes.first()
     }
 
@@ -471,9 +962,7 @@ internal class Camera2PreviewController(
     ) {
         if (width <= 0 || height <= 0) return
         val view = textureView ?: return
-        val characteristics = runCatching {
-            cameraManager.getCameraCharacteristics(lens.cameraId)
-        }.getOrNull() ?: return
+        val characteristics = runCatching { cameraManager.getCameraCharacteristics(lens.cameraId) }.getOrNull() ?: return
         val size = explicitSize ?: choosePreviewSize(characteristics, targetAspect)
         val rotation = view.display?.rotation ?: Surface.ROTATION_0
         val matrix = Matrix()
@@ -486,45 +975,48 @@ internal class Camera2PreviewController(
                 val bufferRect = RectF(0f, 0f, size.height.toFloat(), size.width.toFloat())
                 bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
                 matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-                val scale = max(
-                    height.toFloat() / size.height.toFloat(),
-                    width.toFloat() / size.width.toFloat(),
-                )
+                val scale = max(height.toFloat() / size.height.toFloat(), width.toFloat() / size.width.toFloat())
                 matrix.postScale(scale, scale, centerX, centerY)
-                matrix.postRotate(
-                    if (rotation == Surface.ROTATION_90) -90f else 90f,
-                    centerX,
-                    centerY,
-                )
+                matrix.postRotate(if (rotation == Surface.ROTATION_90) -90f else 90f, centerX, centerY)
             }
             Surface.ROTATION_180 -> matrix.postRotate(180f, centerX, centerY)
         }
 
         if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180) {
             val sourceAspect = sizeAspect(size)
-            val requested = targetAspect
-                ?.takeIf { it.isFinite() && it > 0f }
-                ?.let(::landscapeAspect)
-                ?: sourceAspect
+            val requested = targetAspect?.takeIf { it.isFinite() && it > 0f }?.let(::landscapeAspect) ?: sourceAspect
             when {
-                sourceAspect > requested + 0.01f ->
-                    matrix.postScale(1f, sourceAspect / requested, centerX, centerY)
-                requested > sourceAspect + 0.01f ->
-                    matrix.postScale(requested / sourceAspect, 1f, centerX, centerY)
+                sourceAspect > requested + 0.01f -> matrix.postScale(1f, sourceAspect / requested, centerX, centerY)
+                requested > sourceAspect + 0.01f -> matrix.postScale(requested / sourceAspect, 1f, centerX, centerY)
             }
         }
 
-        // Do not horizontally flip the front camera. Camera2 already provides sensor-oriented
-        // frames; applying a second flip here creates a mirrored viewfinder.
+        // Front preview is deliberately unmirrored.
         view.setTransform(matrix)
     }
 
+    private fun rotationDegrees(rotation: Int): Int = when (rotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+
     private fun emit(state: PreviewState) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            onState(state)
-        } else {
-            mainHandler.post { if (!released) onState(state) }
-        }
+        if (Looper.myLooper() == Looper.getMainLooper()) onState(state)
+        else mainHandler.post { if (!released) onState(state) }
+    }
+
+    private fun emitZoom(state: ZoomState) {
+        mainHandler.post { if (!released) onZoomState(state) }
+    }
+
+    private fun emitFocus(point: FocusPoint?) {
+        mainHandler.post { if (!released) onFocusPoint(point) }
+    }
+
+    private fun emitCapture(state: PhotoCaptureState) {
+        mainHandler.post { if (!released) onCaptureState(state) }
     }
 
     private fun lensKey(lens: ValuableLens, targetAspect: Float?): String =
@@ -539,6 +1031,31 @@ internal class Camera2PreviewController(
         max(size.width, size.height).toFloat() / min(size.width, size.height).coerceAtLeast(1).toFloat()
 
     private fun pixels(size: Size): Long = size.width.toLong() * size.height.toLong()
+
+    private data class PendingPhoto(
+        val aspect: Float,
+        val jpegOrientation: Int,
+        val width: Int,
+        val height: Int,
+    )
+}
+
+internal data class ZoomState(
+    val ratio: Float = 1f,
+    val maxRatio: Float = 1f,
+)
+
+internal data class FocusPoint(
+    val x: Float,
+    val y: Float,
+)
+
+internal sealed interface PhotoCaptureState {
+    data object Idle : PhotoCaptureState
+    data object Capturing : PhotoCaptureState
+    data object Saving : PhotoCaptureState
+    data class Saved(val uri: String) : PhotoCaptureState
+    data class Error(val message: String) : PhotoCaptureState
 }
 
 internal sealed interface PreviewState {
