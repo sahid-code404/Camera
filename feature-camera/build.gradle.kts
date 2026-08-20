@@ -25,6 +25,7 @@ dependencies {
     implementation(project(":core-model"))
     implementation(project(":camera-api"))
     implementation(project(":camera-camera2"))
+    implementation(project(":processing-raw"))
     implementation(project(":feature-settings"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
