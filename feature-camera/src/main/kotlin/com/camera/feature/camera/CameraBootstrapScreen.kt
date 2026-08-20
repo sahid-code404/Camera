@@ -45,6 +45,7 @@ import com.camera.camera.camera2.AndroidCameraCatalog
 import com.camera.camera.camera2.scanValidated
 import com.camera.core.model.ZoomLabel
 import com.camera.feature.settings.LensConfigStore
+import com.camera.feature.settings.LensManagerPanel
 import kotlin.math.abs
 
 @Composable
@@ -56,6 +57,7 @@ fun CameraBootstrapScreen() {
 
     var snapshot by remember { mutableStateOf<CameraCatalogSnapshot?>(null) }
     var discoveryError by remember { mutableStateOf<String?>(null) }
+    var lensManagerOpen by remember { mutableStateOf(false) }
     var cameraPermissionGranted by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -65,13 +67,9 @@ fun CameraBootstrapScreen() {
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        cameraPermissionGranted = granted
-    }
+    ) { granted -> cameraPermissionGranted = granted }
 
     LaunchedEffect(Unit) {
-        // Metadata is useful before permission because it lets diagnostics explain what the HAL says
-        // exists. The stronger session probe runs only after permission is granted.
         runCatching { catalog.scan() }
             .onSuccess { snapshot = it }
             .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
@@ -92,10 +90,7 @@ fun CameraBootstrapScreen() {
     }
 
     MaterialTheme {
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color = Color.Black,
-        ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
             Box(Modifier.fillMaxSize()) {
                 Column(
                     modifier = Modifier
@@ -109,7 +104,9 @@ fun CameraBootstrapScreen() {
                     ) {
                         GlassChip("⚡")
                         GlassChip(if (snapshot?.sessionValidated == true) "VALIDATED" else "CAMERA2")
-                        GlassChip("•••")
+                        GlassChip("•••") {
+                            if (snapshot?.valuableLenses?.isNotEmpty() == true) lensManagerOpen = true
+                        }
                     }
 
                     Spacer(Modifier.weight(1f))
@@ -195,6 +192,13 @@ fun CameraBootstrapScreen() {
                         Mode("PORTRAIT")
                     }
                 }
+
+                if (lensManagerOpen) {
+                    LensManagerPanel(
+                        lenses = snapshot?.valuableLenses.orEmpty(),
+                        onDismiss = { lensManagerOpen = false },
+                    )
+                }
             }
         }
     }
@@ -259,9 +263,10 @@ private fun DiscoveryStatus(
 }
 
 @Composable
-private fun GlassChip(text: String) {
+private fun GlassChip(text: String, onClick: (() -> Unit)? = null) {
+    val modifier = if (onClick == null) Modifier else Modifier.clickable(onClick = onClick)
     Box(
-        Modifier
+        modifier
             .background(Color.White.copy(alpha = 0.12f), CircleShape)
             .padding(horizontal = 14.dp, vertical = 9.dp),
         contentAlignment = Alignment.Center,
