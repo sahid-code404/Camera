@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-Bootstrap / pre-Phase-0.
+Phase 0 + Phase 1 active on `phase/01-foundation-discovery`.
 
 ## Completed
 
@@ -14,23 +14,26 @@ Bootstrap / pre-Phase-0.
 - Photo/video/UI/per-lens configuration strategies documented.
 - Prior Universal-Camera lessons captured.
 - CI bootstrap workflow added.
+- Canonical Phase 0/1 development branch created.
+- Per-lens custom zoom labels added to the domain model and specification.
+- Numeric zoom anchor and user-visible zoom text are explicitly separated so labels never alter optical/zoom math.
 
 ## Not Implemented Yet
 
-- No real Camera2 preview.
-- No camera enumeration.
-- No valuable-lens resolver.
-- No user lens ordering persistence.
-- No still capture.
-- No RAW/DNG.
-- No JPEG/HEIC/Ultra HDR.
-- No computational photography.
-- No video recording.
-- No Portrait/Night/Pro/Slo-mo/Panorama/Time-lapse/Astro.
-- No device benchmarks.
-- No physical-device validation.
+- Real Camera2 preview.
+- Camera enumeration.
+- Valuable-lens resolver.
+- User lens ordering/visibility/custom-label persistence.
+- Still capture.
+- RAW/DNG.
+- JPEG/HEIC/Ultra HDR.
+- Computational photography.
+- Video recording.
+- Portrait/Night/Pro/Slo-mo/Panorama/Time-lapse/Astro.
+- Device benchmarks.
+- Physical-device validation.
 
-## Next Phase
+## Current Work
 
 Phase 0 + Phase 1:
 1. stabilize build/CI,
@@ -38,7 +41,8 @@ Phase 0 + Phase 1:
 3. implement logical/physical graph,
 4. implement valuable-lens resolver,
 5. implement diagnostics and JSON export,
-6. validate on at least one real device.
+6. implement Lens Manager persistence for visibility/order/role/custom name/custom zoom label,
+7. validate on at least one real device.
 
 ## Non-negotiable Quality Rule
 
