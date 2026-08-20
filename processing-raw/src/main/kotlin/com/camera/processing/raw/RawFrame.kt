@@ -22,6 +22,10 @@ data class RawFrame(
     val iso: Int,
     val blackLevels: IntArray,
     val whiteLevel: Int,
+    /** Camera2 AWB gains in R, G-even, G-odd, B order. */
+    val awbGains: FloatArray,
+    /** Camera2 sensor -> linear-sRGB color correction transform, row-major 3x3. */
+    val sensorToLinearSrgb: FloatArray,
 )
 
 data class RawAlignment(
@@ -33,6 +37,7 @@ data class RawAlignment(
 data class FusedRaw(
     val width: Int,
     val height: Int,
+    /** Native engine output. This is now a complete computational Linear DNG. */
     val file: File,
     val referenceResult: CaptureResult,
     val referenceCharacteristics: CameraCharacteristics,
@@ -60,6 +65,25 @@ fun StagedRawPayload.pairWith(
         )
         else -> intArrayOf(0, 0, 0, 0)
     }
+
+    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+        ?: error("RAW capture did not report color-correction gains")
+    val transform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+        ?: error("RAW capture did not report a sensor color transform")
+
+    val matrix = FloatArray(9)
+    for (row in 0 until 3) {
+        for (column in 0 until 3) {
+            val rational = transform.getElement(column, row)
+            require(rational.denominator != 0) { "Invalid RAW color transform denominator" }
+            matrix[row * 3 + column] = rational.numerator.toFloat() / rational.denominator.toFloat()
+        }
+    }
+
+    val dynamicWhite = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL)
+    val staticWhite = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
+    val resolvedWhite = (dynamicWhite ?: staticWhite ?: 65535).coerceAtLeast(1)
+
     return RawFrame(
         timestampNs = timestampNs,
         width = width,
@@ -69,6 +93,13 @@ fun StagedRawPayload.pairWith(
         exposureTimeNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 1L,
         iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100,
         blackLevels = black,
-        whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 65535,
+        whiteLevel = resolvedWhite,
+        awbGains = floatArrayOf(
+            gains.red,
+            gains.greenEven,
+            gains.greenOdd,
+            gains.blue,
+        ),
+        sensorToLinearSrgb = matrix,
     )
 }
