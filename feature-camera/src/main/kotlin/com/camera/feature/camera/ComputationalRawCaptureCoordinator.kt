@@ -156,16 +156,28 @@ internal class ComputationalRawCaptureCoordinator(
                                     result: TotalCaptureResult,
                                 ) {
                                     if (!isActive(state)) return
-                                    val selected = physicalResult(result, lens.physicalCameraId)
-                                    val timestamp = selected.get(CaptureResult.SENSOR_TIMESTAMP)
+                                    val physical = physicalResult(result, lens.physicalCameraId)
+                                    val timestamp = physical.get(CaptureResult.SENSOR_TIMESTAMP)
                                         ?: result.get(CaptureResult.SENSOR_TIMESTAMP)
                                     if (timestamp == null) {
                                         fail(state, "RAW capture result has no sensor timestamp")
                                         return
                                     }
+                                    // Some Qualcomm physical-result payloads omit the AWB/color
+                                    // transform even though the logical TotalCaptureResult contains
+                                    // valid values for the same exposure. Use the physical result
+                                    // only when it carries a complete color calibration payload.
+                                    val metadata = if (
+                                        physical.get(CaptureResult.COLOR_CORRECTION_GAINS) != null &&
+                                        physical.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) != null
+                                    ) {
+                                        physical
+                                    } else {
+                                        result
+                                    }
                                     synchronized(state.lock) {
                                         if (!isActive(state)) return@synchronized
-                                        state.results[timestamp] = selected
+                                        state.results[timestamp] = metadata
                                         pairLocked(state, timestamp)
                                     }
                                     maybeStartProcessing(state)
@@ -343,7 +355,7 @@ internal class ComputationalRawCaptureCoordinator(
                 )
                 try {
                     val description = buildString {
-                        append("Camera native computational DNG")
+                        append("Camera native computational Linear DNG")
                         append(" · frames=${frames.size}")
                         append(" · hdr=${state.settings.hdrEnabled ?: true}")
                         append(" · saturation=${state.settings.saturation ?: 1f}")
@@ -366,7 +378,7 @@ internal class ComputationalRawCaptureCoordinator(
             } catch (error: Throwable) {
                 if (isActive(state)) {
                     active = null
-                    state.onError(error.message ?: "Native computational RAW processing failed")
+                    state.onError(error.message ?: "Native computational DNG processing failed")
                 }
             } finally {
                 frames.forEach { it.file.delete() }
