@@ -17,11 +17,13 @@ object FusedDngWriter {
     fun save(
         context: Context,
         fused: FusedRaw,
-        description: String = "Camera computational DNG",
+        description: String = "Camera computational Linear DNG V2",
     ): String {
         require(fused.file.isFile && fused.file.length() > 0L) { "Native DNG file is missing" }
         val resolver = context.contentResolver
-        val name = "Camera_CRAW_${System.currentTimeMillis()}.dng"
+        // Deliberately different from the legacy Camera_CRAW_* name. A real V2 capture can be
+        // identified without opening metadata, which prevents stale APK/output confusion.
+        val name = "Camera_LINEAR_V2_${System.currentTimeMillis()}.dng"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
