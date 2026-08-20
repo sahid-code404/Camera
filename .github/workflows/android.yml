@@ -30,8 +30,8 @@ jobs:
           cmdline-tools-version: 14742923
           packages: platform-tools
 
-      - name: Install Android SDK
-        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+      - name: Install Android SDK + native toolchain
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
 
       - name: Gradle version
         run: bash ./gradlew --version
@@ -87,12 +87,12 @@ jobs:
           cat > update.json <<EOF
           {
             "versionCode": ${GITHUB_RUN_NUMBER},
-            "versionName": "0.2.0-dev.${GITHUB_RUN_NUMBER}-debug",
+            "versionName": "0.3.0-native.${GITHUB_RUN_NUMBER}-debug",
             "apkUrl": "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ota/${OTA_NAME}",
             "sha256": "${SHA256}"
           }
           EOF
 
           git add -A
-          git commit -m "ota: publish dev build ${GITHUB_RUN_NUMBER}"
+          git commit -m "ota: publish native dev build ${GITHUB_RUN_NUMBER}"
           git push origin HEAD:ota
