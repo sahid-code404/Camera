@@ -21,6 +21,11 @@ import kotlin.math.roundToInt
  * identified primarily by facing + effective physical ID + focal length, not by an arbitrary
  * Camera2 ID. RAW-capable routes are strongly preferred so an alias cannot hide the only genuine
  * RAW_SENSOR path for a piece of glass.
+ *
+ * Some vendor physical-camera characteristics expose real RAW_SENSOR output sizes while omitting
+ * REQUEST_AVAILABLE_CAPABILITIES_RAW. For routing purposes the stream map is stronger evidence:
+ * if RAW_SENSOR sizes are published, the lens is treated as a RAW candidate and the actual Camera2
+ * session remains the final authority at capture time.
  */
 object ValuableCameraResolver {
     data class Resolution(
@@ -38,8 +43,9 @@ object ValuableCameraResolver {
 
         // Camera HALs often expose the same sensor twice: once as a directly enumerated camera and
         // once as a physical member of a logical parent. Match those routes using the effective
-        // sensor ID plus optics, then keep the best route. Crucially, RAW support outranks the
-        // convenience of a direct alias so PHOTO never loses a usable RAW route during de-duping.
+        // sensor ID plus optics, then keep the best route. Crucially, actual RAW_SENSOR stream
+        // availability outranks the convenience of a direct alias so PHOTO never loses a usable
+        // RAW route during de-duping.
         val routeCandidates = profiles
             .groupBy(::effectiveRouteFingerprint)
             .values
@@ -59,9 +65,10 @@ object ValuableCameraResolver {
             // Hide a logical aggregator only when a preferred child can replace it. If the logical
             // route is the only RAW route, keep it instead of exposing a child that cannot capture
             // RAW_SENSOR.
+            val parentHasRaw = hasRawSensorOutput(profile)
             val hasPreferredChild = routeCandidates.any { child ->
                 child.parentLogicalCameraId == profile.routeCameraId &&
-                    (!profile.supportsRaw || child.supportsRaw)
+                    (!parentHasRaw || hasRawSensorOutput(child))
             }
             val logicalAggregator = profile.routeKind == CameraRouteKind.ENUMERATED &&
                 profile.supportsLogicalMultiCamera &&
@@ -104,7 +111,7 @@ object ValuableCameraResolver {
                             focalLengthMm = profile.primaryFocalLengthMm,
                             sensorWidthMm = profile.sensorWidthMm,
                             displayZoomAnchor = anchor,
-                            rawSupported = profile.supportsRaw,
+                            rawSupported = hasRawSensorOutput(profile),
                         ),
                     )
                 }
@@ -166,7 +173,7 @@ object ValuableCameraResolver {
         var score = 0
         // RAW must dominate alias selection. Direct/non-RAW convenience must never hide the only
         // RAW_SENSOR route for an otherwise identical physical camera.
-        if (profile.supportsRaw) score += 256
+        if (hasRawSensorOutput(profile)) score += 256
         if (profile.routeKind == CameraRouteKind.ENUMERATED) score += 100
         if ("BACKWARD_COMPATIBLE" in profile.capabilities) score += 50
         if (profile.parentLogicalCameraId != null) score += 20
@@ -175,6 +182,13 @@ object ValuableCameraResolver {
         score += (profile.maxPhotoPixels / 1_000_000L).coerceAtMost(20L).toInt()
         return score
     }
+
+    /**
+     * A real RAW_SENSOR stream declaration is sufficient to try the route even if a vendor
+     * physical-camera characteristic block forgot to repeat the RAW capability bit.
+     */
+    private fun hasRawSensorOutput(profile: CameraDeviceProfile): Boolean =
+        profile.streams.rawSizes.isNotEmpty() || profile.supportsRaw
 
     /**
      * Camera-Computaional-style first-pass identity. The logical parent ID is intentionally not
