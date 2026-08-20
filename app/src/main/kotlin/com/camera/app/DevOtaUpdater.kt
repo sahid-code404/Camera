@@ -1,4 +1,4 @@
-package com.camera.app
+package com.sahid.camera
 
 import android.app.Activity
 import android.content.Intent
