@@ -2,6 +2,7 @@ package com.camera.feature.camera
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.view.TextureView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -25,6 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,11 +39,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.camera2.AndroidCameraCatalog
-import com.camera.camera.camera2.scanValidated
+import com.camera.core.model.LensFacing
+import com.camera.core.model.ValuableLens
 import com.camera.core.model.ZoomLabel
 import com.camera.feature.settings.LensConfigStore
 import com.camera.feature.settings.LensManagerPanel
@@ -56,7 +60,9 @@ fun CameraBootstrapScreen() {
 
     var snapshot by remember { mutableStateOf<CameraCatalogSnapshot?>(null) }
     var discoveryError by remember { mutableStateOf<String?>(null) }
+    var previewState by remember { mutableStateOf<PreviewState>(PreviewState.Idle) }
     var lensManagerOpen by remember { mutableStateOf(false) }
+    var selectedLensId by remember { mutableStateOf<String?>(null) }
     var cameraPermissionGranted by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -69,16 +75,15 @@ fun CameraBootstrapScreen() {
     ) { granted -> cameraPermissionGranted = granted }
 
     LaunchedEffect(Unit) {
-        runCatching { catalog.scan() }
-            .onSuccess { snapshot = it }
-            .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
         if (!cameraPermissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
+    // Do metadata discovery only on startup. Session-probing every route while a live preview is
+    // being opened causes avoidable camera-service contention on vendor HALs (notably Xiaomi/QTI).
     LaunchedEffect(cameraPermissionGranted) {
         if (!cameraPermissionGranted) return@LaunchedEffect
         discoveryError = null
-        runCatching { catalog.scanValidated(context) }
+        runCatching { catalog.scan() }
             .onSuccess { snapshot = it }
             .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
     }
@@ -88,9 +93,50 @@ fun CameraBootstrapScreen() {
         if (lenses.isNotEmpty()) lensStore.reconcile(lenses)
     }
 
+    val visibleLenses = snapshot?.valuableLenses
+        .orEmpty()
+        .filter { lens -> storedConfigs[lens.id.value]?.visible != false }
+        .sortedBy { lens -> storedConfigs[lens.id.value]?.position ?: lens.userOrder }
+
+    val mainIndex = visibleLenses.indexOfFirst { lens ->
+        val config = storedConfigs[lens.id.value]
+        val anchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor
+        lens.facing == LensFacing.BACK && anchor?.let { abs(it - 1f) < 0.18f } == true
+    }.let { index ->
+        when {
+            index >= 0 -> index
+            visibleLenses.indexOfFirst { it.facing == LensFacing.BACK } >= 0 ->
+                visibleLenses.indexOfFirst { it.facing == LensFacing.BACK }
+            else -> 0
+        }
+    }
+
+    val selectedLens = visibleLenses.firstOrNull { it.id.value == selectedLensId }
+        ?: visibleLenses.getOrNull(mainIndex)
+
+    LaunchedEffect(selectedLens?.id?.value) {
+        if (selectedLens != null && selectedLensId != selectedLens.id.value) {
+            selectedLensId = selectedLens.id.value
+        }
+    }
+
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
             Box(Modifier.fillMaxSize()) {
+                if (cameraPermissionGranted && selectedLens != null) {
+                    CameraPreview(
+                        lens = selectedLens,
+                        onState = { previewState = it },
+                    )
+                }
+
+                // A very light scrim keeps labels readable without hiding the actual preview.
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = if (previewState is PreviewState.Streaming) 0.08f else 0.30f)),
+                )
+
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -102,7 +148,14 @@ fun CameraBootstrapScreen() {
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         GlassChip("⚡")
-                        GlassChip(if (snapshot?.sessionValidated == true) "VALIDATED" else "CAMERA2")
+                        GlassChip(
+                            when (previewState) {
+                                is PreviewState.Streaming -> "LIVE"
+                                is PreviewState.Opening -> "OPENING"
+                                is PreviewState.Error -> "CAMERA ERROR"
+                                PreviewState.Idle -> "CAMERA2"
+                            },
+                        )
                         GlassChip("•••") {
                             if (snapshot?.valuableLenses?.isNotEmpty() == true) lensManagerOpen = true
                         }
@@ -110,24 +163,15 @@ fun CameraBootstrapScreen() {
 
                     Spacer(Modifier.weight(1f))
 
-                    DiscoveryStatus(
+                    CameraStatus(
                         snapshot = snapshot,
-                        error = discoveryError,
+                        discoveryError = discoveryError,
+                        previewState = previewState,
                         permissionGranted = cameraPermissionGranted,
                         onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
                     )
 
                     Spacer(Modifier.weight(1f))
-
-                    val lenses = snapshot?.valuableLenses
-                        .orEmpty()
-                        .filter { lens -> storedConfigs[lens.id.value]?.visible != false }
-                        .sortedBy { lens -> storedConfigs[lens.id.value]?.position ?: lens.userOrder }
-                    val mainIndex = lenses.indexOfFirst { lens ->
-                        val config = storedConfigs[lens.id.value]
-                        val anchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor
-                        anchor?.let { abs(it - 1f) < 0.18f } == true
-                    }.let { if (it >= 0) it else 0 }
 
                     Row(
                         modifier = Modifier
@@ -136,17 +180,18 @@ fun CameraBootstrapScreen() {
                         horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        if (lenses.isEmpty()) {
+                        if (visibleLenses.isEmpty()) {
                             LensPill("…", selected = true)
                         } else {
-                            lenses.forEachIndexed { index, lens ->
+                            visibleLenses.forEach { lens ->
                                 val config = storedConfigs[lens.id.value]
                                 LensPill(
                                     text = ZoomLabel.resolve(
                                         customLabel = config?.customZoomLabel,
                                         numericAnchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor,
                                     ),
-                                    selected = index == mainIndex,
+                                    selected = lens.id.value == selectedLens?.id?.value,
+                                    onClick = { selectedLensId = lens.id.value },
                                 )
                             }
                         }
@@ -162,7 +207,7 @@ fun CameraBootstrapScreen() {
                         Box(
                             Modifier
                                 .size(48.dp)
-                                .background(Color.White.copy(alpha = 0.12f), RoundedCornerShape(14.dp)),
+                                .background(Color.White.copy(alpha = 0.16f), RoundedCornerShape(14.dp)),
                         )
 
                         Box(
@@ -176,7 +221,13 @@ fun CameraBootstrapScreen() {
                         Box(
                             Modifier
                                 .size(48.dp)
-                                .background(Color.White.copy(alpha = 0.12f), CircleShape),
+                                .background(Color.White.copy(alpha = 0.16f), CircleShape)
+                                .clickable {
+                                    selectedLensId = oppositeFacingLens(
+                                        current = selectedLens,
+                                        lenses = visibleLenses,
+                                    )?.id?.value ?: selectedLensId
+                                },
                             contentAlignment = Alignment.Center,
                         ) {
                             Text("↻", color = Color.White, fontSize = 22.sp)
@@ -204,61 +255,74 @@ fun CameraBootstrapScreen() {
 }
 
 @Composable
-private fun DiscoveryStatus(
+private fun CameraPreview(
+    lens: ValuableLens,
+    onState: (PreviewState) -> Unit,
+) {
+    val context = LocalContext.current
+    val controller = remember(context) { Camera2PreviewController(context, onState) }
+
+    AndroidView(
+        factory = { viewContext ->
+            TextureView(viewContext).apply {
+                isOpaque = true
+                controller.bind(this, lens)
+            }
+        },
+        modifier = Modifier.fillMaxSize(),
+        update = { view -> controller.bind(view, lens) },
+    )
+
+    DisposableEffect(controller) {
+        onDispose { controller.release() }
+    }
+}
+
+@Composable
+private fun CameraStatus(
     snapshot: CameraCatalogSnapshot?,
-    error: String?,
+    discoveryError: String?,
+    previewState: PreviewState,
     permissionGranted: Boolean,
     onRequestPermission: () -> Unit,
 ) {
     when {
-        error != null -> {
-            Text("Camera discovery failed", color = Color(0xFFFF8A80), fontSize = 13.sp)
-            Text(error, color = Color.White.copy(alpha = 0.48f), fontSize = 10.sp)
-        }
-        snapshot == null -> {
-            Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.76f), fontSize = 13.sp)
-            Text("Phase 1 · capability discovery", color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp)
-        }
         !permissionGranted -> {
             Text(
-                "${snapshot.deviceProfiles.size} metadata routes found",
-                color = Color.White.copy(alpha = 0.78f),
-                fontSize = 13.sp,
-            )
-            Text(
-                "Grant camera permission to validate lenses",
+                "Camera permission required",
                 color = Color(0xFFFFD54F),
-                fontSize = 11.sp,
+                fontSize = 13.sp,
                 modifier = Modifier.clickable(onClick = onRequestPermission),
             )
         }
-        snapshot.sessionValidated -> {
-            Text(
-                "${snapshot.valuableLenses.size} valuable lenses · ${snapshot.usableRouteCount} usable routes",
-                color = Color.White.copy(alpha = 0.78f),
-                fontSize = 13.sp,
-            )
-            val rawCount = snapshot.deviceProfiles.count { it.supportsRaw }
-            val failed = snapshot.routeProbeResults.count { !it.usable }
-            Text(
-                "$rawCount RAW metadata routes · $failed routes rejected by probe",
-                color = Color.White.copy(alpha = 0.46f),
-                fontSize = 11.sp,
-            )
+        discoveryError != null -> {
+            Text("Camera discovery failed", color = Color(0xFFFF8A80), fontSize = 13.sp)
+            Text(discoveryError, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
         }
-        else -> {
+        previewState is PreviewState.Error -> {
+            Text("Preview unavailable", color = Color(0xFFFF8A80), fontSize = 13.sp)
+            Text(previewState.message, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
+        }
+        snapshot == null -> {
+            Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
+        }
+        previewState is PreviewState.Opening -> {
+            Text("Opening camera…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
+        }
+        previewState is PreviewState.Streaming -> {
+            val physical = previewState.physicalCameraId?.let { " · physical $it" }.orEmpty()
             Text(
-                "${snapshot.valuableLenses.size} candidate lenses · ${snapshot.deviceProfiles.size} routes",
-                color = Color.White.copy(alpha = 0.78f),
-                fontSize = 13.sp,
-            )
-            Text(
-                "Validating Camera2 sessions…",
-                color = Color.White.copy(alpha = 0.46f),
+                "${snapshot.valuableLenses.size} lenses · ${previewState.width}×${previewState.height}$physical",
+                color = Color.White.copy(alpha = 0.68f),
                 fontSize = 11.sp,
             )
         }
     }
+}
+
+private fun oppositeFacingLens(current: ValuableLens?, lenses: List<ValuableLens>): ValuableLens? {
+    val desired = if (current?.facing == LensFacing.FRONT) LensFacing.BACK else LensFacing.FRONT
+    return lenses.firstOrNull { it.facing == desired }
 }
 
 @Composable
@@ -266,7 +330,7 @@ private fun GlassChip(text: String, onClick: (() -> Unit)? = null) {
     val modifier = if (onClick == null) Modifier else Modifier.clickable(onClick = onClick)
     Box(
         modifier
-            .background(Color.White.copy(alpha = 0.12f), CircleShape)
+            .background(Color.Black.copy(alpha = 0.48f), CircleShape)
             .padding(horizontal = 14.dp, vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -275,11 +339,16 @@ private fun GlassChip(text: String, onClick: (() -> Unit)? = null) {
 }
 
 @Composable
-private fun LensPill(text: String, selected: Boolean = false) {
+private fun LensPill(
+    text: String,
+    selected: Boolean = false,
+    onClick: (() -> Unit)? = null,
+) {
+    val clickModifier = if (onClick == null) Modifier else Modifier.clickable(onClick = onClick)
     Box(
-        Modifier
+        clickModifier
             .background(
-                if (selected) Color.White.copy(alpha = 0.22f) else Color.Black.copy(alpha = 0.42f),
+                if (selected) Color.Black.copy(alpha = 0.62f) else Color.Black.copy(alpha = 0.38f),
                 CircleShape,
             )
             .padding(horizontal = if (selected) 18.dp else 13.dp, vertical = 9.dp),
