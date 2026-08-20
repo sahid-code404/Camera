@@ -38,9 +38,19 @@ The custom label is **presentation-only**. It must never alter:
 
 Keep `displayZoomAnchor: Float?` and `customZoomLabel: String?` separate. If a custom label is empty/unset, format the numeric anchor automatically. Settings UI should preview the label exactly as it will appear on the camera screen. Long labels should be normalized/truncated for the compact lens pill while the full lens name remains available in Lens Manager.
 
-## Photo profile
-- output format
-- aspect ratio
+## Global photo composition
+
+Photo aspect ratio is **camera-wide, not per-lens**.
+
+- default: `4:3`
+- options: `1:1`, `4:3`, `16:9`
+- changing the aspect on any lens immediately applies to every rear/front lens
+- switching lenses or facing must never silently change the selected aspect
+- preview framing and processed-photo crop must use the same global composition
+- RAW/DNG keeps the full sensor Bayer frame; the global aspect is applied when rendering the processed photo, so RAW data is not unnecessarily discarded
+
+## Photo profile per lens
+- output format / fallback policy
 - resolution policy
 - Native/Computational RAW
 - HDR
@@ -73,5 +83,7 @@ Keep `displayZoomAnchor: Float?` and `customZoomLabel: String?` separate. If a c
 
 ## Inheritance
 `Global → Mode → Lens → Temporary session override`.
+
+Aspect ratio is a deliberate exception: it remains a global Photo-mode composition value rather than a lens override.
 
 Every settings screen must show whether a value is inherited or explicitly overridden.
