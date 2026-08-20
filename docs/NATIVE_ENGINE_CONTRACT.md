@@ -2,308 +2,464 @@
 
 ## Purpose
 
-This document defines which parts of Camera are allowed to depend on Android framework APIs and which parts must belong to our native engine.
+This document defines the permanent architecture boundary for `Camera`.
 
-The goal is maximum control, performance and reproducibility without pretending a normal non-root application can bypass the vendor camera HAL/kernel.
+The goal is maximum control, performance and reproducibility while acknowledging that a normal non-root Android application must still use Android/vendor interfaces to access camera hardware.
+
+The final photographic decisions belong to **our engine**.
+
+---
 
 ## 1. Boundary rule
 
-Android is the hardware-access boundary.
-
-Our engine owns the photographic/media decisions after the device has delivered a buffer and metadata.
+Android / the vendor HAL is the hardware-access boundary.
 
 Allowed Android responsibilities:
 - permissions,
-- app lifecycle,
-- display surfaces,
-- camera/HAL access,
+- lifecycle,
+- surfaces,
+- public camera access,
 - sensor stream negotiation,
-- device capability discovery,
 - physical/logical camera routing,
-- MediaStore/public file publication,
-- hardware codec access when the user selects the hardware-encode path.
+- capability discovery,
+- storage publication,
+- hardware codec access for optional efficient video paths.
 
-Android must not be treated as the owner of:
-- RAW sample modification,
-- our exposure planning logic,
-- our metadata/calibration model,
-- our video color pipeline,
-- our stabilization algorithm,
-- our scaling policy,
-- our final software-encoded bitstream,
-- our muxing policy,
-- our validation logic.
+Our engine owns:
+- capture planning,
+- RAW burst policy,
+- frame selection,
+- alignment,
+- HDR fusion,
+- denoise,
+- highlight/shadow processing,
+- saturation/vibrance,
+- sharpening/texture,
+- color processing,
+- scaling/upscale/MFSR policy,
+- video frame processing,
+- stabilization,
+- software encoding policy,
+- muxing/container policy,
+- output validation.
+
+Android must not define the aesthetic merely because it delivered the source buffer.
+
+---
 
 ## 2. Language split
 
 ### Kotlin / Compose
-Use only for:
+
+Use for:
 - UI,
 - settings,
-- lifecycle orchestration,
 - permissions,
-- lightweight state machines,
-- user interaction,
-- diagnostics presentation.
+- lifecycle,
+- lightweight orchestration/state machines,
+- diagnostics presentation,
+- passing compact configuration/metadata across the JNI boundary.
 
-Do not put full-frame image processing loops in Kotlin.
+Do not implement full-frame image-processing loops in Kotlin.
 
 ### Native C++
-C++ is the primary high-performance core because Android NDK camera, image, hardware-buffer, codec and Vulkan interfaces are C/C++ friendly.
 
-Use modern C++ for:
-- native buffer ownership,
-- RAW packing/checking,
-- metadata normalization,
+C++ is the primary high-performance engine.
+
+Use for:
+- RAW buffer processing,
 - CFA utilities,
-- matrix/color-calibration math,
+- frame alignment,
+- motion/confidence maps,
+- HDR fusion,
+- noise-aware fusion,
+- detail/sharpening,
+- saturation/color math,
+- crop/scale/upscale,
+- MFSR,
 - histogram/statistics kernels,
-- motion estimation,
 - video frame graph,
 - stabilization,
-- pixel-format conversion,
-- scaling,
+- format conversion,
 - software encoder integration,
-- muxing/container writing,
-- DNG/TIFF parsing and validation,
-- native test corpus tools.
+- muxing/container code,
+- DNG/TIFF parsing/validation and eventually writing where required.
 
 ### SIMD / GPU
+
 Use:
-- ARM NEON for CPU hot loops,
-- Vulkan compute for kernels that benchmark faster after transfer/synchronization cost,
-- AHardwareBuffer where it reduces copies and is supported reliably.
+- ARM NEON for measured CPU hot loops,
+- Vulkan compute for kernels that benchmark faster after synchronization/transfer overhead,
+- `AHardwareBuffer` where it genuinely removes copies.
 
-Never move a kernel to Vulkan just because a GPU exists.
+Do not move an operation to Vulkan only because a GPU exists.
 
-## 3. Memory rules
+---
+
+## 3. Memory/performance rules
 
 Prefer:
 - bounded queues,
-- RAII ownership,
+- RAII native ownership,
+- memory mapping for large RAW scratch frames,
 - direct/native buffers,
-- memory mapping for large temporary data when appropriate,
-- AHardwareBuffer/zero-copy paths where available,
-- one conversion at a pipeline boundary rather than repeated conversions.
+- zero/minimal-copy paths,
+- fixed worker pools,
+- one conversion per required pipeline boundary.
 
 Avoid:
-- Bitmap as a processing master,
-- repeated JNI copies,
-- ByteArray copies of full-resolution frames,
-- unbounded capture queues,
-- retaining Image/AImage objects after their data/metadata has been safely consumed.
+- Bitmap as a photo master,
+- Java/Kotlin full-resolution pixel arrays for processing,
+- repeated JNI copies of full frames,
+- unbounded captures,
+- retaining Camera2 `Image` objects longer than necessary.
 
-## 4. Still-photo contract
+---
 
-Production PHOTO is strict native RAW.
+## 4. PHOTO output contract
 
-Normal capture:
+PHOTO persists **one DNG only** per normal shutter press.
+
+No persisted photographic:
+- JPEG,
+- HEIC/HEIF,
+- PNG,
+- WebP.
+
+The DNG is a **computational DNG** and may contain Bayer/CFA samples created by our processing pipeline rather than untouched samples from one exposure.
+
+This is intentional.
+
+Do not falsely describe computational output as untouched sensor RAW.
+
+Target:
 
 ```text
-sensor
-  -> RAW_SENSOR
-  -> matching capture metadata
-  -> untouched CFA samples
-  -> DNG
-  -> one persisted photo
+RAW_SENSOR burst
+ -> exact Image/CaptureResult pairing
+ -> native C++ processing
+ -> one computational Bayer master
+ -> DNG container
+ -> one saved photo
 ```
 
-No production still-photo operation may apply to the saved CFA samples:
+If a lens exposes no trustworthy `RAW_SENSOR` route, PHOTO must not fake it with JPEG/YUV-to-DNG conversion. That lens may remain available for VIDEO or other future modes where appropriate.
+
+---
+
+## 5. Computational DNG stages
+
+The production native graph may include, depending on per-lens settings and mode:
+- reference-frame scoring,
+- exposure normalization,
+- HDR/bracket fusion,
+- constant-exposure temporal fusion,
+- motion rejection,
 - denoise,
-- sharpening,
+- highlight shaping,
+- shadow shaping,
+- bad/hot-pixel handling,
 - saturation,
-- tone mapping,
-- HDR merge,
-- frame averaging,
-- super-resolution,
-- interpolation,
-- local contrast,
-- skin processing,
-- RGB conversion,
-- gamma.
+- vibrance,
+- warmth/tint,
+- sensor/lens-specific color processing,
+- same-CFA detail/sharpening,
+- aspect crop,
+- interpolation/upscale,
+- genuine multi-frame super-resolution,
+- Night/long-exposure stacking strategies.
 
-Preview analysis may influence the exposure/focus/WB metadata decision, but it does not modify the stored RAW samples.
+All stages need explicit configuration and must be independently bypassable where appropriate.
 
-## 5. RAW integrity
+Per-lens settings are authoritative.
 
-The native core must model, inspect and test:
-- RAW dimensions,
-- row stride,
-- pixel stride,
-- bit packing,
-- CFA arrangement,
-- black level,
-- dynamic black level,
-- white level,
-- active/pre-correction arrays,
-- optical black regions,
-- neutral color point,
-- noise profile,
-- lens shading metadata,
-- color/forward/calibration matrices,
-- reference illuminants,
-- exposure/ISO,
-- focal/aperture/focus metadata,
-- orientation,
-- camera/physical-camera identity.
+---
 
-Never hard-code RGGB or normalize every sensor to 16-bit full scale.
+## 6. Upscale vs true MFSR
 
-## 6. DNG writer policy
+These are different features.
 
-The final DNG must be standards-compliant and independently verifiable.
+### Upscale
+- may interpolate Bayer/CFA planes,
+- may produce larger DNG dimensions,
+- is a user-selectable processing option,
+- must remain identifiable internally as upscale.
 
-Short-term:
-- Android DngCreator may be used only as a standards-correct bridge while the native metadata/validation layer is built.
+### True MFSR
+- requires multiple real sub-pixel observations,
+- requires local/sub-pixel alignment and confidence checks,
+- must add information derived from actual frames rather than only interpolation.
 
-Long-term:
-- if DngCreator prevents required control, use a native DNG/TIFF implementation,
-- prefer a proven standards implementation/SDK or a carefully tested native writer,
-- do not ship a half-correct serializer simply to claim zero Android dependencies.
+Never call simple interpolation genuine MFSR.
 
-The native validation layer must inspect actual generated files, including:
-- TIFF/DNG Compression tag,
-- BitsPerSample,
+---
+
+## 7. Current native PHOTO implementation
+
+The first native engine uses:
+- C++20,
+- NDK/CMake,
+- `mmap` input frames,
+- reference selection,
+- CFA-safe even-pixel alignment,
+- motion rejection,
+- exposure-normalized multi-frame fusion,
+- HDR bracket use,
+- highlight/shadow shaping,
+- sensor-space saturation,
+- same-CFA sharpening,
+- Bayer-preserving upscale,
+- CFA-safe aspect crop.
+
+This is the starting point, not the final flagship algorithm.
+
+Next upgrades:
+- gyro initialization,
+- image pyramid,
+- local/tile alignment,
+- sub-pixel refinement,
+- confidence map,
+- rolling-shutter correction,
+- noise-profile weighting,
+- better reference scoring,
+- NEON acceleration,
+- selectively Vulkan kernels,
+- genuine MFSR.
+
+---
+
+## 8. DNG writer policy
+
+The final saved photograph must be standards-compatible DNG.
+
+Short-term bridge:
+- Android `DngCreator` may package our processed Bayer master while we validate metadata and file structure.
+
+`DngCreator` in this role is a container/metadata bridge; it does not own HDR, saturation, highlights, denoise, sharpness or upscale decisions.
+
+Required validation:
+- output dimensions,
 - CFA tags,
-- dimensions,
-- black/white level tags,
-- matrices,
+- BitsPerSample,
+- Compression tag,
+- black/white levels,
+- color matrices,
+- crop/active-array metadata,
 - orientation,
 - strip/tile offsets,
-- sample integrity.
+- Lightroom/ACR compatibility,
+- darktable/RawTherapee compatibility.
 
-## 7. Exposure intelligence
+If framework DNG writing cannot represent transformed/cropped/upscaled computational Bayer correctly, replace it with a tested native standards-compliant DNG/TIFF writer.
 
-Our native analyzer may consume preview/YUV statistics and sensor metadata to implement:
-- histogram,
-- highlight clipping estimate,
-- shadow distribution,
-- motion estimate,
-- face brightness estimate,
-- focal-length/OIS-aware shutter limits,
-- ETTR-like highlight-safe exposure planning,
-- focus confidence,
-- AWB assistance.
+Do not build a half-correct custom DNG just to remove a framework dependency.
 
-Output of this subsystem is a capture plan, not rendered pixels.
+---
 
-## 8. Video contract
+## 9. Per-lens PHOTO configuration
 
-Video is not the same as strict RAW still photography.
+Every valuable RAW-capable lens may independently configure:
+- HDR on/off/auto policy,
+- HDR strength,
+- highlight behavior,
+- shadow behavior,
+- denoise,
+- temporal denoise,
+- sharpness,
+- texture,
+- saturation,
+- vibrance,
+- warmth,
+- tint,
+- color profile,
+- lens corrections,
+- upscale factor,
+- genuine MFSR,
+- capture-frame count/quality tier,
+- focus/exposure behavior,
+- Night-mode policy.
 
-The pipeline must distinguish three layers:
+A setting is not considered implemented merely because a field exists. It becomes implemented only when a native stage consumes it and device tests verify its effect.
 
-### Layer A — acquisition
-Use the best public stream the device actually exposes:
-- YUV_420_888,
-- P010/10-bit path where truly available,
-- PRIVATE surface where a zero-copy hardware path is required,
-- RAW only if the HAL can actually sustain the requested video rate.
+---
 
-We cannot promise RAW video on devices whose HAL does not expose it.
+## 10. Global aspect rule
 
-### Layer B — our native frame graph
-When CPU/GPU-accessible frames are available, our engine owns:
-- crop,
-- orientation,
-- color transform,
-- tone mapping,
+Photo aspect is camera-wide, not per lens.
+
+Default: `4:3`.
+
+Other initial choices:
+- `1:1`,
+- `16:9`.
+
+Changing lenses/facing must not change the chosen composition.
+
+The preview and final computational DNG composition must agree.
+
+CFA crop origins/dimensions must preserve valid mosaic parity.
+
+---
+
+## 11. Video contract
+
+Video is independent of the DNG-only PHOTO output rule.
+
+### Acquisition
+
+Use the best real stream publicly exposed by the selected lens/device:
+- YUV,
+- P010/10-bit where real,
+- PRIVATE/zero-copy path where useful,
+- RAW only when the HAL can sustain a genuine RAW video stream.
+
+### Native frame graph
+
+When frames are CPU/GPU accessible, our engine owns:
+- crop/orientation,
+- color/WB,
+- HDR/tone,
 - denoise,
 - sharpening/detail,
 - stabilization,
-- HDR mapping,
-- scaling,
-- frame interpolation when explicitly enabled/labeled,
-- overlays/metadata policy.
+- scaling/upscale,
+- frame interpolation when explicitly requested,
+- timestamp/frame pacing policy.
 
-Every stage must be configurable per lens and have an explicit on/off/bypass state.
+### Encoding
 
-### Layer C — encoding and container
-Provide two clearly different paths:
+Provide two paths eventually:
 
-#### Full-control native/software path
-Native encoder library/implementation owns:
-- GOP,
-- keyframes,
-- bitrate/rate control,
-- quantization policy,
-- profile/level constraints,
-- B-frame/reference policy where codec permits,
-- timestamps,
-- bitstream packaging.
+1. **Full-control software/native path**
+   - our codec configuration,
+   - GOP/keyframes,
+   - quantization/rate control,
+   - references/B-frames where relevant,
+   - timestamps,
+   - bitstream packaging,
+   - our muxing/container layer.
 
-Our muxer/container writer owns final file assembly.
+2. **Hardware-efficient path**
+   - Android NDK codec used as an accelerator when efficiency/heat requires it,
+   - our preprocessing and fallback policy remain authoritative where frames are accessible.
 
-This path maximizes control but can cost more CPU, power and heat.
+---
 
-#### Hardware-efficient path
-Use Android NDK MediaCodec only when the user/device needs hardware efficiency.
+## 12. Per-lens VIDEO settings
 
-Even in this mode, our app still owns:
-- requested resolution/FPS,
-- preprocessing when accessible,
-- bitrate policy,
-- fallback policy,
-- metadata labeling,
-- container finalization.
+Every lens should eventually expose independently:
+- resolution,
+- FPS,
+- codec,
+- bitrate,
+- bit depth,
+- HDR/dynamic range,
+- stabilization,
+- OIS/EIS preference,
+- shutter/ISO,
+- focus,
+- WB,
+- audio profile,
+- lens switching,
+- thermal fallback,
+- experimental combinations,
+- upscaled-output policy.
 
-The hardware codec is an accelerator, not the definition of our image aesthetic.
+---
 
-## 9. Video truthfulness
+## 13. Forced 4K policy
 
-Never claim:
-- native 4K if source frames were lower resolution,
-- native 10-bit if source was 8-bit,
-- native HDR if the source/metadata was not HDR,
-- native 120/240 fps if generated by interpolation,
-- RAW video if the frames came from YUV/PRIVATE ISP output.
+Users may request 4K output even when the source lens cannot provide native 4K.
 
-## 10. From-scratch meaning
+Policy:
+1. Use native 3840x2160 when the camera and encoder path actually provide it.
+2. Try guarded experimental native combinations when metadata is ambiguous and session creation may succeed.
+3. If native 4K fails, obtain the best real source stream.
+4. When user explicitly wants 4K output, our native scaler may produce 3840x2160 before encoding.
+5. Keep reliable fallback chains for resolution/FPS/codec/thermal limits.
+6. Track whether the source was native or upscaled internally; never corrupt capability diagnostics.
 
-For this project, "from scratch" means:
-- our architecture,
-- our state machines,
-- our exposure logic,
-- our calibration model,
-- our processing graph,
-- our native kernels,
-- our quality/fallback policy,
-- our validation,
-- our file/container policy.
+Same principle applies to FPS and bit depth.
 
-It does not mean reimplementing a proprietary vendor kernel driver or bypassing Android security.
+---
 
-It also does not require writing a standards-incompatible DNG writer or a brand-new H.265 encoder merely to avoid a mature low-level library.
+## 14. Lens discovery contract
 
-## 11. Performance measurements
+The main UI should show photographic lenses, not raw Camera2 IDs.
 
-Every native optimization must be measured on real hardware.
+Use:
+- logical/physical graph,
+- session validation,
+- optical fingerprints,
+- focal length/FOV/sensor data,
+- route preference,
+- user confirmation.
 
-Record:
-- capture latency,
-- preview frame time,
-- memory copies/frame,
+Hide by default:
+- depth-only routes,
+- non-openable routes,
+- logical aggregators that duplicate physical glass,
+- vendor aliases that represent the same optics.
+
+Let the user:
+- show/hide lenses,
+- reorder lenses,
+- confirm role,
+- rename lens,
+- set custom zoom label.
+
+---
+
+## 15. From-scratch meaning
+
+For `Camera`, from scratch means our:
+- architecture,
+- camera state machines,
+- lens model,
+- capture policy,
+- native processing graph,
+- algorithms/kernels,
+- quality/fallback policy,
+- per-lens configuration,
+- video processing,
+- validation,
+- file/container policy,
+- UI interaction design.
+
+It does not require reimplementing the vendor's kernel camera driver or bypassing Android security.
+
+---
+
+## 16. Performance measurements
+
+Measure on real devices:
+- shutter/acquisition latency,
+- RAW staging throughput,
+- native processing time per stage,
 - peak RAM,
-- CPU utilization,
-- GPU utilization,
+- disk scratch throughput,
+- CPU use,
+- GPU use,
 - thermal state,
+- preview frame time,
+- video dropped frames,
 - encoder throughput,
-- dropped frames,
-- DNG write throughput,
-- file finalization latency.
+- file-finalization latency.
 
-Optimize the measured bottleneck, not an assumed one.
+Optimize measured bottlenecks.
 
-## 12. Non-negotiable architecture test
+---
 
-A code review should be able to answer:
+## 17. Architecture review checklist
 
-1. Where did this frame originate?
-2. Which Android/HAL stage touched it before our engine?
-3. Which of our native stages touched it?
-4. Was any conversion lossy?
-5. Who chose its exposure/color/scale/encode policy?
-6. Does the UI label its true capability accurately?
-7. Can the output be independently validated?
+For every output, reviewers must be able to answer:
+1. Which logical/physical lens supplied the source?
+2. Which format/resolution did the HAL actually deliver?
+3. Which native stages touched the data?
+4. Which per-lens settings were active?
+5. Was any operation destructive/lossy by design?
+6. Is the output native-resolution, interpolated upscale or genuine MFSR?
+7. Does the preview composition match the output composition?
+8. Can the final DNG/video be independently validated?
 
 If those answers are ambiguous, the feature is not ready.
