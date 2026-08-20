@@ -14,6 +14,7 @@ import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
@@ -38,6 +39,7 @@ internal class Camera2PreviewController(
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
     private val thread = HandlerThread("Camera2Preview").apply { start() }
     private val handler = Handler(thread.looper)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executor { command -> handler.post(command) }
 
     private var textureView: TextureView? = null
@@ -46,6 +48,7 @@ internal class Camera2PreviewController(
     private var previewSurface: Surface? = null
     private var activeLensKey: String? = null
     private var pendingLens: ValuableLens? = null
+    private var opening = false
     private var released = false
 
     fun bind(view: TextureView, lens: ValuableLens?) {
@@ -58,13 +61,13 @@ internal class Camera2PreviewController(
         }
 
         val key = lens?.let(::lensKey)
-        if (key == activeLensKey && cameraDevice != null && captureSession != null) return
+        if (key == activeLensKey && (opening || cameraDevice != null || captureSession != null)) return
 
         if (view.isAvailable && lens != null) {
             open(lens)
         } else if (lens == null) {
             closeCamera()
-            onState(PreviewState.Idle)
+            emit(PreviewState.Idle)
         }
     }
 
@@ -101,11 +104,12 @@ internal class Camera2PreviewController(
         val texture = view.surfaceTexture ?: return
         val key = lensKey(lens)
 
-        if (key == activeLensKey && cameraDevice != null) return
+        if (key == activeLensKey && (opening || cameraDevice != null)) return
 
         closeCamera()
         activeLensKey = key
-        onState(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
+        opening = true
+        emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
 
         runCatching {
             val characteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
@@ -117,6 +121,7 @@ internal class Camera2PreviewController(
                 lens.cameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
+                        opening = false
                         if (released || activeLensKey != key) {
                             camera.close()
                             return
@@ -126,22 +131,25 @@ internal class Camera2PreviewController(
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
+                        opening = false
                         if (cameraDevice === camera) cameraDevice = null
                         camera.close()
-                        onState(PreviewState.Error("Camera disconnected"))
+                        emit(PreviewState.Error("Camera disconnected"))
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
+                        opening = false
                         if (cameraDevice === camera) cameraDevice = null
                         camera.close()
-                        onState(PreviewState.Error("Camera open error $error"))
+                        emit(PreviewState.Error("Camera open error $error"))
                     }
                 },
                 handler,
             )
         }.onFailure { error ->
+            opening = false
             closeCamera()
-            onState(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
         }
     }
 
@@ -176,7 +184,7 @@ internal class Camera2PreviewController(
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         session.close()
                         if (captureSession === session) captureSession = null
-                        onState(
+                        emit(
                             PreviewState.Error(
                                 if (lens.physicalCameraId != null) {
                                     "Physical lens ${lens.physicalCameraId} rejected the preview session"
@@ -190,7 +198,7 @@ internal class Camera2PreviewController(
             )
             camera.createCaptureSession(sessionConfig)
         }.onFailure { error ->
-            onState(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
         }
     }
 
@@ -217,7 +225,7 @@ internal class Camera2PreviewController(
                 }
             }
             session.setRepeatingRequest(request.build(), null, handler)
-            onState(
+            emit(
                 PreviewState.Streaming(
                     cameraId = lens.cameraId,
                     physicalCameraId = lens.physicalCameraId,
@@ -226,11 +234,12 @@ internal class Camera2PreviewController(
                 ),
             )
         }.onFailure { error ->
-            onState(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
         }
     }
 
     private fun closeCamera() {
+        opening = false
         runCatching { captureSession?.stopRepeating() }
         runCatching { captureSession?.abortCaptures() }
         runCatching { captureSession?.close() }
@@ -309,6 +318,14 @@ internal class Camera2PreviewController(
             Surface.ROTATION_180 -> matrix.postRotate(180f, centerX, centerY)
         }
         view.setTransform(matrix)
+    }
+
+    private fun emit(state: PreviewState) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            onState(state)
+        } else {
+            mainHandler.post { if (!released) onState(state) }
+        }
     }
 
     private fun lensKey(lens: ValuableLens): String =
