@@ -72,6 +72,64 @@ class ValuableCameraResolverTest {
     }
 
     @Test
+    fun duplicateDirectVendorAliasesWithSameOpticsCollapseToOneLens() {
+        val preferred = profile(
+            routeCameraId = "0",
+            facing = LensFacing.BACK,
+            focal = 4.5f,
+            sensorWidth = 6.4f,
+            sensorHeight = 4.8f,
+            activeWidth = 4000,
+            activeHeight = 3000,
+            apertures = listOf(1.8f),
+            supportsRaw = true,
+            supportsManualSensor = true,
+        )
+        val vendorAlias = profile(
+            routeCameraId = "20",
+            facing = LensFacing.BACK,
+            focal = 4.5f,
+            sensorWidth = 6.4f,
+            sensorHeight = 4.8f,
+            activeWidth = 4000,
+            activeHeight = 3000,
+            apertures = listOf(1.8f),
+        )
+
+        val result = ValuableCameraResolver.resolve(listOf(vendorAlias, preferred))
+
+        assertEquals(1, result.lenses.size)
+        assertEquals("0", result.lenses.single().cameraId)
+        assertTrue("20:direct" in result.hiddenRouteKeys)
+    }
+
+    @Test
+    fun genuinelyDifferentOpticsRemainSeparateEvenWhenResolutionMatches() {
+        val main = profile(
+            routeCameraId = "0",
+            facing = LensFacing.BACK,
+            focal = 4.5f,
+            sensorWidth = 6.4f,
+            sensorHeight = 4.8f,
+            activeWidth = 4000,
+            activeHeight = 3000,
+        )
+        val ultra = profile(
+            routeCameraId = "3",
+            facing = LensFacing.BACK,
+            focal = 2.2f,
+            sensorWidth = 5.8f,
+            sensorHeight = 4.35f,
+            activeWidth = 4000,
+            activeHeight = 3000,
+        )
+
+        val result = ValuableCameraResolver.resolve(listOf(main, ultra))
+
+        assertEquals(2, result.lenses.size)
+    }
+
+    @Test
     fun zoomAnchorsAreComputedFromOpticsNotCameraIds() {
         val ultra = profile("99", LensFacing.BACK, 2.2f, 5.8f)
         val main = profile("abc", LensFacing.BACK, 4.5f, 6.4f)
@@ -129,6 +187,12 @@ class ValuableCameraResolverTest {
         logical: Boolean = false,
         capabilities: Set<String> = setOf("BACKWARD_COMPATIBLE"),
         photoSize: PixelSize? = PixelSize(4000, 3000),
+        sensorHeight: Float? = sensorWidth?.times(0.75f),
+        activeWidth: Int? = photoSize?.width,
+        activeHeight: Int? = photoSize?.height,
+        apertures: List<Float> = emptyList(),
+        supportsRaw: Boolean = false,
+        supportsManualSensor: Boolean = false,
     ): CameraDeviceProfile = CameraDeviceProfile(
         routeCameraId = routeCameraId,
         physicalCameraId = physicalCameraId,
@@ -139,8 +203,14 @@ class ValuableCameraResolverTest {
         capabilities = capabilities,
         logicalPhysicalIds = physicalIds,
         focalLengthsMm = focal?.let(::listOf).orEmpty(),
+        apertures = apertures,
         sensorWidthMm = sensorWidth,
+        sensorHeightMm = sensorHeight,
+        activeArrayWidth = activeWidth,
+        activeArrayHeight = activeHeight,
         streams = CameraStreamCapabilities(jpegSizes = photoSize?.let(::listOf).orEmpty()),
+        supportsRaw = supportsRaw,
+        supportsManualSensor = supportsManualSensor,
         supportsLogicalMultiCamera = logical,
     )
 }
