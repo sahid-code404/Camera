@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.sp
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.camera2.AndroidCameraCatalog
 import com.camera.core.model.ZoomLabel
+import kotlin.math.abs
 
 @Composable
 fun CameraBootstrapScreen() {
@@ -77,6 +78,9 @@ fun CameraBootstrapScreen() {
                     Spacer(Modifier.weight(1f))
 
                     val lenses = snapshot?.valuableLenses.orEmpty()
+                    val mainIndex = lenses.indexOfFirst { lens ->
+                        lens.displayZoomAnchor?.let { abs(it - 1f) < 0.18f } == true
+                    }.let { if (it >= 0) it else 0 }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -90,8 +94,7 @@ fun CameraBootstrapScreen() {
                             lenses.forEachIndexed { index, lens ->
                                 LensPill(
                                     text = ZoomLabel.resolve(null, lens.displayZoomAnchor),
-                                    selected = index == lenses.indexOfFirst { it.displayZoomAnchor?.let { z -> kotlin.math.abs(z - 1f) < 0.18f } == true }
-                                        .takeIf { it } ?: (index == 0),
+                                    selected = index == mainIndex,
                                 )
                             }
                         }
