@@ -1,6 +1,7 @@
 package com.camera.camera.camera2
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
@@ -90,7 +91,10 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
         }
     }
 
+    @SuppressLint("MissingPermission")
     private suspend fun openDevice(cameraId: String): CameraDevice = suspendCancellableCoroutine { continuation ->
+        // probe() performs the runtime permission gate immediately before this method. The lint
+        // suppression is deliberately narrow rather than suppressing permission checks globally.
         val opened = AtomicReference<CameraDevice?>(null)
         val callback = object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
