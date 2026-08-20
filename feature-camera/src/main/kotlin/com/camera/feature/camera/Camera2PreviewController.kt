@@ -68,7 +68,11 @@ internal class Camera2PreviewController(
         }
 
         val key = lens?.let { lensKey(it, targetAspect) }
-        if (key == activeLensKey && (opening || cameraDevice != null || captureSession != null)) {
+        if (
+            lens != null &&
+            key == activeLensKey &&
+            (opening || cameraDevice != null || captureSession != null)
+        ) {
             configureTransform(lens, view.width, view.height, targetAspect = targetAspect)
             return
         }
