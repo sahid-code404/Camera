@@ -24,6 +24,7 @@ android {
 dependencies {
     implementation(project(":core-model"))
     implementation(project(":camera-api"))
+    implementation(project(":camera-camera2"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(platform(libs.androidx.compose.bom))
