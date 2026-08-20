@@ -12,8 +12,10 @@ if (devKeySource.exists()) {
     devKeyFile.writeBytes(Base64.getMimeDecoder().decode(devKeySource.readText()))
 }
 
-val ciBuildNumber = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.toIntOrNull()
-val devVersionCode = ciBuildNumber ?: 2
+val ciBuildNumber = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.toIntOrNull() ?: 2
+// Keep development builds far above the earlier run-number-only version codes so a stale
+// pre-Linear-DNG APK can never silently win an update comparison on-device.
+val devVersionCode = 100_000 + ciBuildNumber
 
 android {
     namespace = "com.camera.app"
@@ -26,7 +28,7 @@ android {
         minSdk = 28
         targetSdk = 37
         versionCode = devVersionCode
-        versionName = "0.2.0-dev.$devVersionCode"
+        versionName = "0.3.0-linear.$ciBuildNumber"
         buildConfigField(
             "String",
             "OTA_MANIFEST_URL",
