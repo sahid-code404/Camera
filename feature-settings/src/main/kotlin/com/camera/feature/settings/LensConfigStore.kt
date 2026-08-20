@@ -21,8 +21,8 @@ private val Context.lensPreferences by preferencesDataStore(name = "camera_lense
  * Persistent user overrides for lens visibility, ordering and naming.
  *
  * The stable lens ID is the key. Camera2 list order and numeric camera IDs are never used as the
- * persistence identity. Photo/video tuning fields will be added to this schema in Phase 8 without
- * changing the stable identity contract.
+ * persistence identity. Photo/video tuning fields will be added to this schema later without
+ * changing that identity contract.
  */
 class LensConfigStore(context: Context) {
     private val appContext = context.applicationContext
@@ -35,35 +35,38 @@ class LensConfigStore(context: Context) {
         val existing = configs.first().toMutableMap()
         val active = discovered.map { lens ->
             val previous = existing[lens.id.value]
-            val resolved = previous ?: LensUserConfig(
-                lensId = lens.id,
-                visible = lens.userVisible,
-                position = lens.userOrder,
-                customName = lens.userName,
-                displayZoomAnchor = lens.displayZoomAnchor,
-            )
+            val resolved = if (previous == null) {
+                LensUserConfig(
+                    lensId = lens.id,
+                    visible = lens.userVisible,
+                    position = lens.userOrder,
+                    customName = lens.userName,
+                    displayZoomAnchor = lens.displayZoomAnchor,
+                )
+            } else {
+                // Keep user overrides, but backfill an optical anchor if an older stored profile did
+                // not have one. The custom visible label remains presentation-only.
+                previous.copy(
+                    displayZoomAnchor = previous.displayZoomAnchor ?: lens.displayZoomAnchor,
+                )
+            }
             existing[lens.id.value] = resolved
             resolved
-        }.sortedBy { it.position }
+        }.sortedWith(compareBy<LensUserConfig> { it.position }.thenBy { it.lensId.value })
         write(existing)
         return active
     }
 
     suspend fun save(config: LensUserConfig) {
         val existing = configs.first().toMutableMap()
-        existing[config.lensId.value] = config.copy(
-            customZoomLabel = ZoomLabel.normalizeCustom(config.customZoomLabel),
-        )
+        existing[config.lensId.value] = sanitize(config)
         write(existing)
     }
 
     suspend fun saveLayout(configs: List<LensUserConfig>) {
         val existing = this.configs.first().toMutableMap()
         configs.forEachIndexed { index, config ->
-            existing[config.lensId.value] = config.copy(
-                position = index,
-                customZoomLabel = ZoomLabel.normalizeCustom(config.customZoomLabel),
-            )
+            existing[config.lensId.value] = sanitize(config.copy(position = index))
         }
         write(existing)
     }
@@ -74,6 +77,13 @@ class LensConfigStore(context: Context) {
         write(existing)
     }
 
+    private fun sanitize(config: LensUserConfig): LensUserConfig = config.copy(
+        customName = config.customName?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_CUSTOM_NAME_LENGTH),
+        customZoomLabel = ZoomLabel.normalizeCustom(config.customZoomLabel),
+        displayZoomAnchor = config.displayZoomAnchor?.takeIf { it.isFinite() && it > 0f },
+        position = config.position.coerceAtLeast(0),
+    )
+
     private suspend fun write(configs: Map<String, LensUserConfig>) {
         val encoded = encode(configs)
         appContext.lensPreferences.edit { prefs -> prefs[KEY_LAYOUT] = encoded }
@@ -82,6 +92,7 @@ class LensConfigStore(context: Context) {
     private fun encode(configs: Map<String, LensUserConfig>): String {
         val array = JSONArray()
         configs.values
+            .map(::sanitize)
             .sortedWith(compareBy<LensUserConfig> { it.position }.thenBy { it.lensId.value })
             .forEach { config ->
                 array.put(
@@ -92,11 +103,11 @@ class LensConfigStore(context: Context) {
                         .put("role", config.confirmedRole?.name ?: JSONObject.NULL)
                         .put("name", config.customName ?: JSONObject.NULL)
                         .put("zoomAnchor", config.displayZoomAnchor ?: JSONObject.NULL)
-                        .put("zoomLabel", ZoomLabel.normalizeCustom(config.customZoomLabel) ?: JSONObject.NULL),
+                        .put("zoomLabel", config.customZoomLabel ?: JSONObject.NULL),
                 )
             }
         return JSONObject()
-            .put("schemaVersion", 1)
+            .put("schemaVersion", SCHEMA_VERSION)
             .put("lenses", array)
             .toString()
     }
@@ -109,25 +120,26 @@ class LensConfigStore(context: Context) {
             buildMap {
                 for (index in 0 until array.length()) {
                     val item = array.optJSONObject(index) ?: continue
-                    val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
-                    val role = item.optString("role")
-                        .takeIf { it.isNotBlank() }
+                    val id = item.optNullableString("id") ?: continue
+                    val role = item.optNullableString("role")
                         ?.let { value -> runCatching { LensRole.valueOf(value) }.getOrNull() }
-                    val name = item.optString("name").takeIf { it.isNotBlank() }
-                    val label = item.optString("zoomLabel").takeIf { it.isNotBlank() }
                     val anchor = if (item.has("zoomAnchor") && !item.isNull("zoomAnchor")) {
-                        item.optDouble("zoomAnchor").toFloat().takeIf { it.isFinite() && it > 0f }
+                        item.optDouble("zoomAnchor")
+                            .toFloat()
+                            .takeIf { it.isFinite() && it > 0f }
                     } else null
                     put(
                         id,
-                        LensUserConfig(
-                            lensId = LensStableId(id),
-                            visible = item.optBoolean("visible", true),
-                            position = item.optInt("position", index),
-                            confirmedRole = role,
-                            customName = name,
-                            displayZoomAnchor = anchor,
-                            customZoomLabel = ZoomLabel.normalizeCustom(label),
+                        sanitize(
+                            LensUserConfig(
+                                lensId = LensStableId(id),
+                                visible = item.optBoolean("visible", true),
+                                position = item.optInt("position", index),
+                                confirmedRole = role,
+                                customName = item.optNullableString("name"),
+                                displayZoomAnchor = anchor,
+                                customZoomLabel = item.optNullableString("zoomLabel"),
+                            ),
                         ),
                     )
                 }
@@ -135,7 +147,14 @@ class LensConfigStore(context: Context) {
         }.getOrDefault(emptyMap())
     }
 
+    private fun JSONObject.optNullableString(key: String): String? {
+        if (!has(key) || isNull(key)) return null
+        return optString(key).trim().takeIf { it.isNotEmpty() }
+    }
+
     private companion object {
+        const val SCHEMA_VERSION = 1
+        const val MAX_CUSTOM_NAME_LENGTH = 32
         val KEY_LAYOUT = stringPreferencesKey("lens_layout_v1")
     }
 }
