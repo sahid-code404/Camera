@@ -20,6 +20,7 @@ object NativeComputationalRawEngine {
         frames: List<RawFrame>,
         characteristics: CameraCharacteristics,
         settings: PhotoLensSettings,
+        targetAspect: Float,
         outputDirectory: File,
     ): FusedRaw {
         require(frames.isNotEmpty()) { "At least one RAW frame is required" }
@@ -51,6 +52,7 @@ object NativeComputationalRawEngine {
             ?.coerceIn(1, 4)
             ?: 1
         val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
+        val aspect = targetAspect.takeIf { it.isFinite() && it > 0f } ?: 4f / 3f
 
         val metrics = nativeProcess(
             inputPaths = frames.map { it.file.absolutePath }.toTypedArray(),
@@ -69,6 +71,7 @@ object NativeComputationalRawEngine {
             sharpness = sharpness,
             saturation = saturation,
             upscaleFactor = upscale,
+            targetAspect = aspect,
             outputPath = output.absolutePath,
         )
 
@@ -124,6 +127,7 @@ object NativeComputationalRawEngine {
         sharpness: Float,
         saturation: Float,
         upscaleFactor: Int,
+        targetAspect: Float,
         outputPath: String,
     ): LongArray
 
