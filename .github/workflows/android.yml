@@ -1,0 +1,51 @@
+name: Android CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'phase/**'
+      - 'experiment/**'
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 14742923
+          packages: platform-tools
+
+      - name: Install Android SDK
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+
+      - name: Gradle version
+        run: bash ./gradlew --version
+
+      - name: Unit tests
+        run: bash ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Lint
+        run: bash ./gradlew lintDebug --stacktrace
+
+      - name: Assemble debug APK
+        run: bash ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-phase-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
