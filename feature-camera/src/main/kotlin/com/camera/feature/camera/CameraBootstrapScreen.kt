@@ -50,6 +50,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.camera2.AndroidCameraCatalog
 import com.camera.core.model.LensFacing
+import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
 import com.camera.core.model.ZoomLabel
 import com.camera.feature.settings.LensConfigStore
@@ -138,34 +139,36 @@ fun CameraBootstrapScreen() {
         if (lenses.isNotEmpty()) lensStore.reconcile(lenses)
     }
 
-    val visibleLenses = snapshot?.valuableLenses
+    val allVisibleLenses = snapshot?.valuableLenses
         .orEmpty()
         .filter { lens -> storedConfigs[lens.id.value]?.visible != false }
         .sortedBy { lens -> storedConfigs[lens.id.value]?.position ?: lens.userOrder }
 
-    val mainIndex = visibleLenses.indexOfFirst { lens ->
+    // PHOTO is DNG-only. Do not fake RAW with a processed route. Other modes may use the full
+    // valuable-lens list later when their native pipelines are implemented.
+    val photoLenses = allVisibleLenses.filter { it.rawSupported }
+
+    val mainIndex = photoLenses.indexOfFirst { lens ->
         val config = storedConfigs[lens.id.value]
         val anchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor
         lens.facing == LensFacing.BACK && anchor?.let { abs(it - 1f) < 0.18f } == true
     }.let { index ->
         when {
             index >= 0 -> index
-            visibleLenses.indexOfFirst { it.facing == LensFacing.BACK } >= 0 ->
-                visibleLenses.indexOfFirst { it.facing == LensFacing.BACK }
+            photoLenses.indexOfFirst { it.facing == LensFacing.BACK } >= 0 ->
+                photoLenses.indexOfFirst { it.facing == LensFacing.BACK }
             else -> 0
         }
     }
 
-    val selectedLens = visibleLenses.firstOrNull { it.id.value == selectedLensId }
-        ?: visibleLenses.getOrNull(mainIndex)
-    val facingLenses = visibleLenses.filter { lens -> lens.facing == selectedLens?.facing }
+    val selectedLens = photoLenses.firstOrNull { it.id.value == selectedLensId }
+        ?: photoLenses.getOrNull(mainIndex)
+    val facingLenses = photoLenses.filter { lens -> lens.facing == selectedLens?.facing }
 
     LaunchedEffect(selectedLens?.id?.value) {
         if (selectedLens != null && selectedLensId != selectedLens.id.value) {
             selectedLensId = selectedLens.id.value
         }
-        // Composition aspect is intentionally global. Lens/facing changes must never silently
-        // change the user's framing choice.
         aspectMenuOpen = false
         focusPoint = null
         captureState = PhotoCaptureState.Idle
@@ -228,7 +231,7 @@ fun CameraBootstrapScreen() {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        GlassChip("⚡")
+                        GlassChip("RAW")
                         GlassChip(selectedAspect.label) { aspectMenuOpen = !aspectMenuOpen }
                         GlassChip("•••") {
                             if (snapshot?.valuableLenses?.isNotEmpty() == true) lensManagerOpen = true
@@ -243,6 +246,7 @@ fun CameraBootstrapScreen() {
                         previewState = previewState,
                         captureState = captureState,
                         permissionGranted = cameraPermissionGranted,
+                        rawLensCount = photoLenses.size,
                         onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
                     )
 
@@ -256,7 +260,7 @@ fun CameraBootstrapScreen() {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (facingLenses.isEmpty()) {
-                            LensPill("…", selected = true)
+                            LensPill("RAW", selected = true)
                         } else {
                             facingLenses.forEach { lens ->
                                 val config = storedConfigs[lens.id.value]
@@ -314,7 +318,8 @@ fun CameraBootstrapScreen() {
                             }
                         }
 
-                        val shutterReady = previewState is PreviewState.Streaming &&
+                        val shutterReady = selectedLens != null &&
+                            previewState is PreviewState.Streaming &&
                             captureState !is PhotoCaptureState.Capturing &&
                             captureState !is PhotoCaptureState.Saving
                         Box(
@@ -331,8 +336,12 @@ fun CameraBootstrapScreen() {
                                     CircleShape,
                                 )
                                 .clickable(enabled = shutterReady) {
+                                    val lens = selectedLens ?: return@clickable
                                     captureState = PhotoCaptureState.Capturing
-                                    controller.capturePhoto(selectedAspect.ratio)
+                                    controller.capturePhoto(
+                                        targetAspect = selectedAspect.ratio,
+                                        settings = storedConfigs[lens.id.value]?.photo ?: PhotoLensSettings(),
+                                    )
                                 },
                         )
 
@@ -343,7 +352,7 @@ fun CameraBootstrapScreen() {
                                 .clickable {
                                     selectedLensId = oppositeFacingLens(
                                         current = selectedLens,
-                                        lenses = visibleLenses,
+                                        lenses = photoLenses,
                                         configs = storedConfigs,
                                     )?.id?.value ?: selectedLensId
                                 },
@@ -371,8 +380,6 @@ fun CameraBootstrapScreen() {
                             focusPoint = null
                             uiPrefs.edit()
                                 .putString(GLOBAL_PHOTO_ASPECT_KEY, aspect.name)
-                                // Keep the old default key updated for seamless migration from the
-                                // earlier per-lens implementation. No per-lens aspect key is written.
                                 .putString("default_photo_aspect", aspect.name)
                                 .apply()
                         },
@@ -454,6 +461,7 @@ private fun CameraStatus(
     previewState: PreviewState,
     captureState: PhotoCaptureState,
     permissionGranted: Boolean,
+    rawLensCount: Int,
     onRequestPermission: () -> Unit,
 ) {
     when {
@@ -471,6 +479,9 @@ private fun CameraStatus(
                 Text(discoveryError, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
             }
         }
+        snapshot != null && rawLensCount == 0 -> {
+            Text("No enabled lens exposes RAW_SENSOR", color = Color(0xFFFF8A80), fontSize = 13.sp)
+        }
         previewState is PreviewState.Error -> {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Preview unavailable", color = Color(0xFFFF8A80), fontSize = 13.sp)
@@ -479,12 +490,12 @@ private fun CameraStatus(
         }
         captureState is PhotoCaptureState.Error -> {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Photo failed", color = Color(0xFFFF8A80), fontSize = 13.sp)
+                Text("DNG failed", color = Color(0xFFFF8A80), fontSize = 13.sp)
                 Text(captureState.message, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
             }
         }
         captureState is PhotoCaptureState.Saving -> {
-            Text("Processing photo…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
+            Text("Native DNG processing…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
         }
         snapshot == null -> {
             Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
