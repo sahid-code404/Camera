@@ -103,6 +103,21 @@ class ValuableCameraResolverTest {
         assertFalse(result.hiddenRouteKeys.isEmpty())
     }
 
+    @Test
+    fun validationRejectsMetadataOnlyRouteThatCouldNotCreateSession() {
+        val main = profile("main", LensFacing.BACK, 4.5f, 6.4f)
+        val vendorAux = profile("aux", LensFacing.BACK, 8.0f, 5.0f)
+
+        val result = ValuableCameraResolver.resolve(
+            profiles = listOf(main, vendorAux),
+            validatedRouteKeys = setOf("main:direct"),
+        )
+
+        assertEquals(1, result.lenses.size)
+        assertEquals("main", result.lenses.single().cameraId)
+        assertTrue("aux:direct" in result.hiddenRouteKeys)
+    }
+
     private fun profile(
         routeCameraId: String,
         facing: LensFacing,
