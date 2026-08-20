@@ -1,6 +1,6 @@
 {
-  "versionCode": 128,
-  "versionName": "0.2.0-dev.128-debug",
-  "apkUrl": "https://raw.githubusercontent.com/sahid-code404/Camera/ota/Camera-dev-128.apk",
-  "sha256": "22fa05b316f93c932dc9ac5f572c2c8a0b3749e6da63479f179162aa6ebf9ad6"
+  "versionCode": 134,
+  "versionName": "0.3.0-native.134-debug",
+  "apkUrl": "https://raw.githubusercontent.com/sahid-code404/Camera/ota/Camera-dev-134.apk",
+  "sha256": "38edc9e58326a4159b22f2558faf28cdcf660a78ed399eaef1609dd45ed47048"
 }
