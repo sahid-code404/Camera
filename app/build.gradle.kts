@@ -18,13 +18,12 @@ val ciBuildNumber = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.t
 val devVersionCode = 100_000 + ciBuildNumber
 
 android {
-    namespace = "com.camera.app"
+    // Keep the installed app identity aligned with Camera-Computaional.
+    namespace = "com.sahid.camera"
     compileSdk = 37
 
     defaultConfig {
-        // Qualcomm/Xiaomi vendor camera stacks commonly whitelist this identity for aux cameras.
-        // This is a development compatibility identity, not a production package name.
-        applicationId = "org.codeaurora.snapcam"
+        applicationId = "com.sahid.camera"
         minSdk = 28
         targetSdk = 37
         versionCode = devVersionCode
