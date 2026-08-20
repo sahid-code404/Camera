@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.os.Build
 import android.util.Range
 import android.util.Size
@@ -25,14 +26,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Public-API Camera2 discovery implementation.
- *
- * It intentionally separates raw hardware routes from user-visible ValuableLens resolution. Camera
- * IDs are opaque strings: no numeric ID or OEM table is used to infer optical role.
+ * Public Camera2 hardware discovery. Camera IDs are treated as opaque strings and optical roles are
+ * resolved later from metadata, never from OEM-specific numeric ID assumptions.
  */
-class AndroidCameraCatalog(
-    context: Context,
-) : CameraCatalog {
+class AndroidCameraCatalog(context: Context) : CameraCatalog {
     private val manager = context.applicationContext.getSystemService(CameraManager::class.java)
 
     override suspend fun scan(): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
@@ -51,27 +48,40 @@ class AndroidCameraCatalog(
 
         val physicalMembers = buildList {
             enumerated.forEach { parent ->
-                parent.logicalPhysicalIds.forEach { physicalId ->
-                    val child = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
-                        ?: return@forEach
-                    add(
-                        buildProfile(
-                            routeCameraId = parent.routeCameraId,
-                            physicalCameraId = physicalId,
-                            parentLogicalCameraId = parent.routeCameraId,
-                            routeKind = CameraRouteKind.LOGICAL_PHYSICAL_MEMBER,
-                            characteristics = child,
-                            inheritedFacing = parent.facing,
-                        ),
+                parent.logicalPhysicalIds.forEach physical@ { physicalId ->
+                    val characteristics = runCatching {
+                        manager.getCameraCharacteristics(physicalId)
+                    }.getOrNull() ?: return@physical
+
+                    var child = buildProfile(
+                        routeCameraId = parent.routeCameraId,
+                        physicalCameraId = physicalId,
+                        parentLogicalCameraId = parent.routeCameraId,
+                        routeKind = CameraRouteKind.LOGICAL_PHYSICAL_MEMBER,
+                        characteristics = characteristics,
+                        inheritedFacing = parent.facing,
                     )
+
+                    // Physical characteristics are allowed to omit a standalone stream map because
+                    // the physical sensor is routed through its logical parent. Keep the parent's
+                    // stream candidates for discovery, then Phase 1 session probing will determine
+                    // which combinations are truly routable on this physical member.
+                    if (child.maxPhotoPixels == 0L && parent.maxPhotoPixels > 0L) {
+                        child = child.copy(
+                            streams = parent.streams,
+                            discoveryWarnings = child.discoveryWarnings +
+                                "Stream candidates inherited from logical parent; session probe required",
+                        )
+                    }
+                    add(child)
                 }
             }
         }
 
         val profiles = (enumerated + physicalMembers)
             .distinctBy { "${it.routeCameraId}:${it.physicalCameraId ?: "direct"}" }
-
         val resolution = ValuableCameraResolver.resolve(profiles)
+
         CameraCatalogSnapshot(
             deviceProfiles = profiles,
             valuableLenses = resolution.lenses,
@@ -88,60 +98,38 @@ class AndroidCameraCatalog(
         inheritedFacing: LensFacing?,
     ): CameraDeviceProfile {
         val warnings = mutableListOf<String>()
-        val capabilities = characteristics
+        val capabilityValues = characteristics
             .get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?.toSet()
             .orEmpty()
-        val capabilityNames = capabilities.mapTo(sortedSetOf(), ::capabilityName)
+        val capabilityNames = capabilityValues.mapTo(sortedSetOf()) { capabilityName(it) }
         val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val maxResolutionMap = if (Build.VERSION.SDK_INT >= 31) {
+        val maximumMap = if (Build.VERSION.SDK_INT >= 31) {
             characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
         } else null
-
-        if (streamMap == null) warnings += "No SCALER_STREAM_CONFIGURATION_MAP"
+        if (streamMap == null) warnings += "No standalone stream configuration map"
 
         val facing = facingOf(characteristics.get(CameraCharacteristics.LENS_FACING))
             .takeUnless { it == LensFacing.UNKNOWN }
             ?: inheritedFacing
             ?: LensFacing.UNKNOWN
-
         val physicalSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-        val zoom = if (Build.VERSION.SDK_INT >= 30) {
-            characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.toFloatValueRange()
-        } else null
-        val iso = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.toIntValueRange()
-        val exposure = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.toLongValueRange()
-        val oisModes = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION).orEmpty()
-        val eisModes = characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES).orEmpty()
         val blackPattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
-        val physicalIds = if (Build.VERSION.SDK_INT >= 28) characteristics.physicalCameraIds else emptySet()
-
-        val normalStreams = streamCapabilities(streamMap)
-        val maximumStreams = streamCapabilities(maxResolutionMap)
-        val mergedStreams = mergeStreams(normalStreams, maximumStreams)
-
-        val highSpeed = streamMap?.let { map ->
-            runCatching {
-                map.highSpeedVideoSizes.flatMap { size ->
-                    map.getHighSpeedVideoFpsRangesFor(size).map { fps ->
-                        HighSpeedVideoProfile(size.toPixelSize(), fps.lower, fps.upper)
-                    }
-                }
-            }.getOrElse {
-                warnings += "High-speed configuration query failed: ${it.javaClass.simpleName}"
-                emptyList()
-            }
-        }.orEmpty()
-
-        val fpsRanges = characteristics
-            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-            ?.map { IntValueRange(it.lower, it.upper) }
+        val physicalIds = characteristics.physicalCameraIds
+        val oisModes = characteristics
+            .get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            .orEmpty()
+        val eisModes = characteristics
+            .get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
             .orEmpty()
 
-        val supportsRaw = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities
-        val supportsLogical = Build.VERSION.SDK_INT >= 28 &&
-            CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA in capabilities
+        val mergedStreams = mergeStreams(
+            streamCapabilities(streamMap),
+            streamCapabilities(maximumMap),
+        )
+        val highSpeed = readHighSpeed(streamMap, warnings)
+        val supportsRaw = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilityValues
 
         return CameraDeviceProfile(
             routeCameraId = routeCameraId,
@@ -149,30 +137,46 @@ class AndroidCameraCatalog(
             parentLogicalCameraId = parentLogicalCameraId,
             routeKind = routeKind,
             facing = facing,
-            hardwareLevel = hardwareLevelName(characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)),
+            hardwareLevel = hardwareLevelName(
+                characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL),
+            ),
             capabilities = capabilityNames,
             logicalPhysicalIds = physicalIds,
-            focalLengthsMm = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            focalLengthsMm = characteristics
+                .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                 ?.filter { it > 0f }
                 .orEmpty(),
-            apertures = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)
+            apertures = characteristics
+                .get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)
                 ?.filter { it > 0f }
                 .orEmpty(),
             sensorWidthMm = physicalSize?.width,
             sensorHeightMm = physicalSize?.height,
             activeArrayWidth = active?.width(),
             activeArrayHeight = active?.height(),
-            minimumFocusDistanceDiopters = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE),
+            minimumFocusDistanceDiopters =
+                characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE),
             flashAvailable = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
             oisAvailable = oisModes.contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON),
             eisAvailable = eisModes.contains(CameraCharacteristics.CONTROL_VIDEO_STABILIZATION_MODE_ON),
-            zoomRatioRange = zoom,
-            isoRange = iso,
-            exposureTimeRangeNs = exposure,
+            zoomRatioRange = if (Build.VERSION.SDK_INT >= 30) {
+                characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.toFloatValueRange()
+            } else null,
+            isoRange = characteristics
+                .get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                ?.toIntValueRange(),
+            exposureTimeRangeNs = characteristics
+                .get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                ?.toLongValueRange(),
             maxAnalogIso = characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY),
-            aeFpsRanges = fpsRanges,
+            aeFpsRanges = characteristics
+                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.map { IntValueRange(it.lower, it.upper) }
+                .orEmpty(),
             streams = mergedStreams.copy(highSpeedVideo = highSpeed),
-            cfaArrangement = cfaName(characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)),
+            cfaArrangement = cfaName(
+                characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT),
+            ),
             whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL),
             blackLevels = blackPattern?.let { pattern ->
                 listOf(
@@ -183,77 +187,99 @@ class AndroidCameraCatalog(
                 )
             }.orEmpty(),
             supportsRaw = supportsRaw,
-            supportsManualSensor = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in capabilities,
+            supportsManualSensor =
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in capabilityValues,
             supportsManualPostProcessing =
-                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING in capabilities,
-            supportsBurstCapture = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE in capabilities,
-            supportsLogicalMultiCamera = supportsLogical,
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING in capabilityValues,
+            supportsBurstCapture =
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BURST_CAPTURE in capabilityValues,
+            supportsLogicalMultiCamera =
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA in capabilityValues,
             supportsPrivateReprocessing =
-                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_PRIVATE_REPROCESSING in capabilities,
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_PRIVATE_REPROCESSING in capabilityValues,
             supportsYuvReprocessing =
-                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_YUV_REPROCESSING in capabilities,
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_YUV_REPROCESSING in capabilityValues,
             supportsUltraHighResolution = Build.VERSION.SDK_INT >= 31 &&
-                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in capabilities,
-            dynamicRangeProfiles = if (Build.VERSION.SDK_INT >= 33 &&
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR in capabilityValues,
+            dynamicRangeProfiles = if (
+                Build.VERSION.SDK_INT >= 33 &&
                 characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES) != null
             ) listOf("AVAILABLE") else emptyList(),
-            colorSpaceProfiles = if (Build.VERSION.SDK_INT >= 34 &&
+            colorSpaceProfiles = if (
+                Build.VERSION.SDK_INT >= 34 &&
                 characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_COLOR_SPACE_PROFILES) != null
             ) listOf("AVAILABLE") else emptyList(),
             discoveryWarnings = warnings,
         )
     }
 
-    private fun streamCapabilities(map: android.hardware.camera2.params.StreamConfigurationMap?): CameraStreamCapabilities {
+    private fun streamCapabilities(map: StreamConfigurationMap?): CameraStreamCapabilities {
         if (map == null) return CameraStreamCapabilities()
         return CameraStreamCapabilities(
             rawSizes = outputSizes(map, ImageFormat.RAW_SENSOR),
             jpegSizes = outputSizes(map, ImageFormat.JPEG),
-            heicSizes = if (Build.VERSION.SDK_INT >= 28) outputSizes(map, ImageFormat.HEIC) else emptyList(),
-            ultraHdrJpegSizes = if (Build.VERSION.SDK_INT >= 34) outputSizes(map, ImageFormat.JPEG_R) else emptyList(),
+            heicSizes = outputSizes(map, ImageFormat.HEIC),
+            ultraHdrJpegSizes = if (Build.VERSION.SDK_INT >= 34) {
+                outputSizes(map, ImageFormat.JPEG_R)
+            } else emptyList(),
             yuvSizes = outputSizes(map, ImageFormat.YUV_420_888),
             privateSizes = outputSizes(map, ImageFormat.PRIVATE),
         )
     }
 
-    private fun outputSizes(
-        map: android.hardware.camera2.params.StreamConfigurationMap,
-        format: Int,
-    ): List<PixelSize> = runCatching {
-        map.getOutputSizes(format)
-            ?.map(Size::toPixelSize)
-            ?.distinct()
-            ?.sortedByDescending(PixelSize::area)
-            .orEmpty()
-    }.getOrDefault(emptyList())
+    private fun outputSizes(map: StreamConfigurationMap, format: Int): List<PixelSize> =
+        runCatching {
+            map.getOutputSizes(format)
+                ?.map { size -> size.toPixelSize() }
+                ?.distinct()
+                ?.sortedByDescending { it.area }
+                .orEmpty()
+        }.getOrDefault(emptyList())
 
-    private fun mergeStreams(a: CameraStreamCapabilities, b: CameraStreamCapabilities): CameraStreamCapabilities =
-        CameraStreamCapabilities(
-            rawSizes = mergeSizes(a.rawSizes, b.rawSizes),
-            jpegSizes = mergeSizes(a.jpegSizes, b.jpegSizes),
-            heicSizes = mergeSizes(a.heicSizes, b.heicSizes),
-            ultraHdrJpegSizes = mergeSizes(a.ultraHdrJpegSizes, b.ultraHdrJpegSizes),
-            yuvSizes = mergeSizes(a.yuvSizes, b.yuvSizes),
-            privateSizes = mergeSizes(a.privateSizes, b.privateSizes),
-        )
+    private fun readHighSpeed(
+        map: StreamConfigurationMap?,
+        warnings: MutableList<String>,
+    ): List<HighSpeedVideoProfile> {
+        if (map == null) return emptyList()
+        return runCatching {
+            map.highSpeedVideoSizes.flatMap { size ->
+                map.getHighSpeedVideoFpsRangesFor(size).map { range ->
+                    HighSpeedVideoProfile(size.toPixelSize(), range.lower, range.upper)
+                }
+            }.distinct()
+        }.getOrElse { error ->
+            warnings += "High-speed query failed: ${error.javaClass.simpleName}"
+            emptyList()
+        }
+    }
 
-    private fun mergeSizes(a: List<PixelSize>, b: List<PixelSize>): List<PixelSize> =
-        (a + b).distinct().sortedByDescending(PixelSize::area)
+    private fun mergeStreams(
+        first: CameraStreamCapabilities,
+        second: CameraStreamCapabilities,
+    ): CameraStreamCapabilities = CameraStreamCapabilities(
+        rawSizes = mergeSizes(first.rawSizes, second.rawSizes),
+        jpegSizes = mergeSizes(first.jpegSizes, second.jpegSizes),
+        heicSizes = mergeSizes(first.heicSizes, second.heicSizes),
+        ultraHdrJpegSizes = mergeSizes(first.ultraHdrJpegSizes, second.ultraHdrJpegSizes),
+        yuvSizes = mergeSizes(first.yuvSizes, second.yuvSizes),
+        privateSizes = mergeSizes(first.privateSizes, second.privateSizes),
+    )
+
+    private fun mergeSizes(first: List<PixelSize>, second: List<PixelSize>): List<PixelSize> =
+        (first + second).distinct().sortedByDescending { it.area }
 
     private fun diagnosticsJson(
         profiles: List<CameraDeviceProfile>,
         hidden: Set<String>,
     ): String {
-        val root = JSONObject()
-        root.put("schemaVersion", 1)
-        root.put("cameraCount", profiles.size)
-        val array = JSONArray()
+        val cameras = JSONArray()
         profiles.forEach { profile ->
-            val key = "${profile.routeCameraId}:${profile.physicalCameraId ?: "direct"}"
-            array.put(
+            val routeKey = "${profile.routeCameraId}:${profile.physicalCameraId ?: "direct"}"
+            cameras.put(
                 JSONObject()
                     .put("routeCameraId", profile.routeCameraId)
                     .put("physicalCameraId", profile.physicalCameraId ?: JSONObject.NULL)
+                    .put("parentLogicalCameraId", profile.parentLogicalCameraId ?: JSONObject.NULL)
                     .put("routeKind", profile.routeKind.name)
                     .put("facing", profile.facing.name)
                     .put("hardwareLevel", profile.hardwareLevel)
@@ -265,13 +291,16 @@ class AndroidCameraCatalog(
                     .put("logical", profile.supportsLogicalMultiCamera)
                     .put("physicalIds", JSONArray(profile.logicalPhysicalIds.toList()))
                     .put("maxPhotoPixels", profile.maxPhotoPixels)
-                    .put("hiddenByDefault", key in hidden)
+                    .put("hiddenByDefault", routeKey in hidden)
                     .put("capabilities", JSONArray(profile.capabilities.toList()))
                     .put("warnings", JSONArray(profile.discoveryWarnings)),
             )
         }
-        root.put("cameras", array)
-        return root.toString(2)
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("cameraCount", profiles.size)
+            .put("cameras", cameras)
+            .toString(2)
     }
 
     private fun facingOf(value: Int?): LensFacing = when (value) {
