@@ -2,7 +2,6 @@ package com.camera.processing.raw
 
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.TotalCaptureResult
 import java.io.File
 
 /** File-backed RAW16 payload copied out of ImageReader as quickly as possible. */
@@ -18,7 +17,7 @@ data class RawFrame(
     val width: Int,
     val height: Int,
     val file: File,
-    val result: TotalCaptureResult,
+    val result: CaptureResult,
     val exposureTimeNs: Long,
     val iso: Int,
     val blackLevels: IntArray,
@@ -35,7 +34,7 @@ data class FusedRaw(
     val width: Int,
     val height: Int,
     val file: File,
-    val referenceResult: TotalCaptureResult,
+    val referenceResult: CaptureResult,
     val referenceCharacteristics: CameraCharacteristics,
     val frameCount: Int,
     val alignments: List<RawAlignment>,
@@ -44,7 +43,7 @@ data class FusedRaw(
 )
 
 fun StagedRawPayload.pairWith(
-    result: TotalCaptureResult,
+    result: CaptureResult,
     characteristics: CameraCharacteristics,
 ): RawFrame {
     val dynamic = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
