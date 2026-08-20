@@ -7,6 +7,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.camera.core.model.LensRole
 import com.camera.core.model.LensStableId
 import com.camera.core.model.LensUserConfig
+import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
 import com.camera.core.model.ZoomLabel
 import kotlinx.coroutines.flow.Flow
@@ -17,13 +18,7 @@ import org.json.JSONObject
 
 private val Context.lensPreferences by preferencesDataStore(name = "camera_lenses")
 
-/**
- * Persistent user overrides for lens visibility, ordering and naming.
- *
- * The stable lens ID is the key. Camera2 list order and numeric camera IDs are never used as the
- * persistence identity. Photo/video tuning fields will be added to this schema later without
- * changing that identity contract.
- */
+/** Persistent per-lens layout + computational photo configuration keyed by stable lens identity. */
 class LensConfigStore(context: Context) {
     private val appContext = context.applicationContext
 
@@ -44,14 +39,12 @@ class LensConfigStore(context: Context) {
                     displayZoomAnchor = lens.displayZoomAnchor,
                 )
             } else {
-                // Keep user overrides, but backfill an optical anchor if an older stored profile did
-                // not have one. The custom visible label remains presentation-only.
                 previous.copy(
                     displayZoomAnchor = previous.displayZoomAnchor ?: lens.displayZoomAnchor,
                 )
             }
-            existing[lens.id.value] = resolved
-            resolved
+            existing[lens.id.value] = sanitize(resolved)
+            sanitize(resolved)
         }.sortedWith(compareBy<LensUserConfig> { it.position }.thenBy { it.lensId.value })
         write(existing)
         return active
@@ -82,11 +75,29 @@ class LensConfigStore(context: Context) {
         customZoomLabel = ZoomLabel.normalizeCustom(config.customZoomLabel),
         displayZoomAnchor = config.displayZoomAnchor?.takeIf { it.isFinite() && it > 0f },
         position = config.position.coerceAtLeast(0),
+        photo = sanitizePhoto(config.photo),
     )
 
+    private fun sanitizePhoto(photo: PhotoLensSettings): PhotoLensSettings = photo.copy(
+        hdrStrength = photo.hdrStrength.clampOrNull(0f, 2f),
+        highlightProtection = photo.highlightProtection.clampOrNull(0f, 2f),
+        shadowRecovery = photo.shadowRecovery.clampOrNull(0f, 2f),
+        denoise = photo.denoise.clampOrNull(0f, 2f),
+        temporalDenoise = photo.temporalDenoise.clampOrNull(0f, 2f),
+        sharpness = photo.sharpness.clampOrNull(0f, 2f),
+        texture = photo.texture.clampOrNull(0f, 2f),
+        saturation = photo.saturation.clampOrNull(0f, 2.5f),
+        vibrance = photo.vibrance.clampOrNull(0f, 2.5f),
+        warmth = photo.warmth.clampOrNull(-1f, 1f),
+        tint = photo.tint.clampOrNull(-1f, 1f),
+        upscaleFactor = photo.upscaleFactor.clampOrNull(1f, 4f),
+    )
+
+    private fun Float?.clampOrNull(min: Float, max: Float): Float? =
+        this?.takeIf { it.isFinite() }?.coerceIn(min, max)
+
     private suspend fun write(configs: Map<String, LensUserConfig>) {
-        val encoded = encode(configs)
-        appContext.lensPreferences.edit { prefs -> prefs[KEY_LAYOUT] = encoded }
+        appContext.lensPreferences.edit { prefs -> prefs[KEY_LAYOUT] = encode(configs) }
     }
 
     private fun encode(configs: Map<String, LensUserConfig>): String {
@@ -103,13 +114,35 @@ class LensConfigStore(context: Context) {
                         .put("role", config.confirmedRole?.name ?: JSONObject.NULL)
                         .put("name", config.customName ?: JSONObject.NULL)
                         .put("zoomAnchor", config.displayZoomAnchor ?: JSONObject.NULL)
-                        .put("zoomLabel", config.customZoomLabel ?: JSONObject.NULL),
+                        .put("zoomLabel", config.customZoomLabel ?: JSONObject.NULL)
+                        .put("photo", encodePhoto(config.photo)),
                 )
             }
         return JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
             .put("lenses", array)
             .toString()
+    }
+
+    private fun encodePhoto(photo: PhotoLensSettings): JSONObject = JSONObject().apply {
+        putNullable("hdrEnabled", photo.hdrEnabled)
+        putNullable("hdrStrength", photo.hdrStrength)
+        putNullable("highlightProtection", photo.highlightProtection)
+        putNullable("shadowRecovery", photo.shadowRecovery)
+        putNullable("denoise", photo.denoise)
+        putNullable("temporalDenoise", photo.temporalDenoise)
+        putNullable("sharpness", photo.sharpness)
+        putNullable("texture", photo.texture)
+        putNullable("saturation", photo.saturation)
+        putNullable("vibrance", photo.vibrance)
+        putNullable("warmth", photo.warmth)
+        putNullable("tint", photo.tint)
+        putNullable("upscaleFactor", photo.upscaleFactor)
+        putNullable("trueMultiFrameSuperResolution", photo.trueMultiFrameSuperResolution)
+    }
+
+    private fun JSONObject.putNullable(key: String, value: Any?) {
+        put(key, value ?: JSONObject.NULL)
     }
 
     private fun decode(raw: String?): Map<String, LensUserConfig> {
@@ -123,11 +156,7 @@ class LensConfigStore(context: Context) {
                     val id = item.optNullableString("id") ?: continue
                     val role = item.optNullableString("role")
                         ?.let { value -> runCatching { LensRole.valueOf(value) }.getOrNull() }
-                    val anchor = if (item.has("zoomAnchor") && !item.isNull("zoomAnchor")) {
-                        item.optDouble("zoomAnchor")
-                            .toFloat()
-                            .takeIf { it.isFinite() && it > 0f }
-                    } else null
+                    val anchor = item.optNullableFloat("zoomAnchor")?.takeIf { it > 0f }
                     put(
                         id,
                         sanitize(
@@ -139,6 +168,7 @@ class LensConfigStore(context: Context) {
                                 customName = item.optNullableString("name"),
                                 displayZoomAnchor = anchor,
                                 customZoomLabel = item.optNullableString("zoomLabel"),
+                                photo = decodePhoto(item.optJSONObject("photo")),
                             ),
                         ),
                     )
@@ -147,13 +177,43 @@ class LensConfigStore(context: Context) {
         }.getOrDefault(emptyMap())
     }
 
+    private fun decodePhoto(item: JSONObject?): PhotoLensSettings {
+        if (item == null) return PhotoLensSettings()
+        return PhotoLensSettings(
+            hdrEnabled = item.optNullableBoolean("hdrEnabled"),
+            hdrStrength = item.optNullableFloat("hdrStrength"),
+            highlightProtection = item.optNullableFloat("highlightProtection"),
+            shadowRecovery = item.optNullableFloat("shadowRecovery"),
+            denoise = item.optNullableFloat("denoise"),
+            temporalDenoise = item.optNullableFloat("temporalDenoise"),
+            sharpness = item.optNullableFloat("sharpness"),
+            texture = item.optNullableFloat("texture"),
+            saturation = item.optNullableFloat("saturation"),
+            vibrance = item.optNullableFloat("vibrance"),
+            warmth = item.optNullableFloat("warmth"),
+            tint = item.optNullableFloat("tint"),
+            upscaleFactor = item.optNullableFloat("upscaleFactor"),
+            trueMultiFrameSuperResolution = item.optNullableBoolean("trueMultiFrameSuperResolution"),
+        )
+    }
+
     private fun JSONObject.optNullableString(key: String): String? {
         if (!has(key) || isNull(key)) return null
         return optString(key).trim().takeIf { it.isNotEmpty() }
     }
 
+    private fun JSONObject.optNullableFloat(key: String): Float? {
+        if (!has(key) || isNull(key)) return null
+        return optDouble(key).toFloat().takeIf { it.isFinite() }
+    }
+
+    private fun JSONObject.optNullableBoolean(key: String): Boolean? {
+        if (!has(key) || isNull(key)) return null
+        return optBoolean(key)
+    }
+
     private companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
         const val MAX_CUSTOM_NAME_LENGTH = 32
         val KEY_LAYOUT = stringPreferencesKey("lens_layout_v1")
     }
