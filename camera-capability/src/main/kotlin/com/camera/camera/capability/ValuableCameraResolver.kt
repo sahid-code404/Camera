@@ -16,6 +16,11 @@ import kotlin.math.roundToInt
  * physical-member aliases, depth routes and alternate ISP pipelines. The main camera UI must show
  * useful optical cameras, not raw IDs. This resolver therefore classifies by public capability and
  * optical fingerprint rather than hard-coded Qualcomm/Xiaomi camera numbers.
+ *
+ * The effective-route de-duplication mirrors the Camera-Computaional foundation logic: a lens is
+ * identified primarily by facing + effective physical ID + focal length, not by an arbitrary
+ * Camera2 ID. RAW-capable routes are strongly preferred so an alias cannot hide the only genuine
+ * RAW_SENSOR path for a piece of glass.
  */
 object ValuableCameraResolver {
     data class Resolution(
@@ -30,19 +35,20 @@ object ValuableCameraResolver {
         if (profiles.isEmpty()) return Resolution(emptyList(), emptySet())
 
         val hidden = mutableSetOf<String>()
-        val enumeratedIds = profiles
-            .filter { it.routeKind == CameraRouteKind.ENUMERATED }
-            .mapTo(mutableSetOf()) { it.routeCameraId }
 
-        // If a physical member is also independently enumerated, prefer the direct route. Keeping
-        // both would create two buttons that drive the same sensor on many QTI/Xiaomi HALs.
-        val routeCandidates = profiles.filterNot { profile ->
-            val duplicatePhysicalMember =
-                profile.routeKind == CameraRouteKind.LOGICAL_PHYSICAL_MEMBER &&
-                    profile.physicalCameraId in enumeratedIds
-            if (duplicatePhysicalMember) hidden += routeKey(profile)
-            duplicatePhysicalMember
-        }
+        // Camera HALs often expose the same sensor twice: once as a directly enumerated camera and
+        // once as a physical member of a logical parent. Match those routes using the effective
+        // sensor ID plus optics, then keep the best route. Crucially, RAW support outranks the
+        // convenience of a direct alias so PHOTO never loses a usable RAW route during de-duping.
+        val routeCandidates = profiles
+            .groupBy(::effectiveRouteFingerprint)
+            .values
+            .map { group ->
+                val preferred = group.sortedWith(routePreferenceComparator).first()
+                group.filterNot { routeKey(it) == routeKey(preferred) }
+                    .forEach { duplicate -> hidden += routeKey(duplicate) }
+                preferred
+            }
 
         val eligible = routeCandidates.filter { profile ->
             val photographic = isPhotographicRoute(profile)
@@ -50,10 +56,17 @@ object ValuableCameraResolver {
             if (!photographic || !validated) hidden += routeKey(profile)
             photographic && validated
         }.filterNot { profile ->
+            // Hide a logical aggregator only when a preferred child can replace it. If the logical
+            // route is the only RAW route, keep it instead of exposing a child that cannot capture
+            // RAW_SENSOR.
+            val hasPreferredChild = routeCandidates.any { child ->
+                child.parentLogicalCameraId == profile.routeCameraId &&
+                    (!profile.supportsRaw || child.supportsRaw)
+            }
             val logicalAggregator = profile.routeKind == CameraRouteKind.ENUMERATED &&
                 profile.supportsLogicalMultiCamera &&
                 profile.logicalPhysicalIds.isNotEmpty() &&
-                routeCandidates.any { it.parentLogicalCameraId == profile.routeCameraId }
+                hasPreferredChild
             if (logicalAggregator) hidden += routeKey(profile)
             logicalAggregator
         }
@@ -151,14 +164,30 @@ object ValuableCameraResolver {
 
     private fun routePreferenceScore(profile: CameraDeviceProfile): Int {
         var score = 0
+        // RAW must dominate alias selection. Direct/non-RAW convenience must never hide the only
+        // RAW_SENSOR route for an otherwise identical physical camera.
+        if (profile.supportsRaw) score += 256
         if (profile.routeKind == CameraRouteKind.ENUMERATED) score += 100
         if ("BACKWARD_COMPATIBLE" in profile.capabilities) score += 50
         if (profile.parentLogicalCameraId != null) score += 20
-        if (profile.supportsRaw) score += 16
         if (profile.supportsManualSensor) score += 8
         if (profile.supportsBurstCapture) score += 4
         score += (profile.maxPhotoPixels / 1_000_000L).coerceAtMost(20L).toInt()
         return score
+    }
+
+    /**
+     * Camera-Computaional-style first-pass identity. The logical parent ID is intentionally not
+     * used when a physical ID exists; this lets a direct vendor alias and its logical/physical
+     * route meet in the same bucket without hard-coded camera numbers.
+     */
+    private fun effectiveRouteFingerprint(profile: CameraDeviceProfile): String {
+        val effectiveId = profile.physicalCameraId ?: profile.routeCameraId
+        val focalBucket = profile.primaryFocalLengthMm
+            ?.let { quantize(it, 100f) }
+            ?.toString()
+            ?: "na"
+        return "${profile.facing.name}:$effectiveId:$focalBucket"
     }
 
     /**
