@@ -15,9 +15,10 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.util.Size
+import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
 import com.camera.processing.raw.FusedDngWriter
-import com.camera.processing.raw.RawBurstFusion
+import com.camera.processing.raw.NativeComputationalRawEngine
 import com.camera.processing.raw.RawFrame
 import com.camera.processing.raw.RawFrameStager
 import com.camera.processing.raw.StagedRawPayload
@@ -25,12 +26,13 @@ import com.camera.processing.raw.pairWith
 import java.io.File
 import java.util.concurrent.Executor
 import kotlin.math.max
+import kotlin.math.pow
 
 /**
- * Owns only the short RAW acquisition transaction. Heavy fusion stays in :processing-raw.
+ * Owns only the short RAW acquisition transaction.
  *
- * Normal computational capture uses a constant-exposure burst. Bracketed assist frames belong to a
- * later scene-aware HDR planner; they are not the default burst direction.
+ * Full-frame pixel processing is native C++ in :processing-raw. Android Camera2 is used only to
+ * obtain genuine RAW_SENSOR buffers and matching capture metadata.
  */
 internal class ComputationalRawCaptureCoordinator(
     context: android.content.Context,
@@ -58,6 +60,7 @@ internal class ComputationalRawCaptureCoordinator(
         lens: ValuableLens,
         captureCharacteristics: CameraCharacteristics,
         latestPreviewResult: TotalCaptureResult?,
+        settings: PhotoLensSettings,
         onAcquisitionFinished: () -> Unit,
         onProcessing: (Int) -> Unit,
         onSaved: (String) -> Unit,
@@ -66,7 +69,11 @@ internal class ComputationalRawCaptureCoordinator(
         cancel(notify = false)
         scratchDir.mkdirs()
         scratchDir.listFiles()
-            ?.filter { it.name.startsWith("camera_raw_") || it.name.startsWith("camera_fused_") }
+            ?.filter {
+                it.name.startsWith("camera_raw_") ||
+                    it.name.startsWith("camera_fused_") ||
+                    it.name.startsWith("camera_native_")
+            }
             ?.forEach { runCatching { it.delete() } }
 
         val rawSize = chooseRawSize(captureCharacteristics)
@@ -85,6 +92,7 @@ internal class ComputationalRawCaptureCoordinator(
             generation = myGeneration,
             lens = lens,
             characteristics = captureCharacteristics,
+            settings = settings,
             reader = reader,
             onAcquisitionFinished = onAcquisitionFinished,
             onProcessing = onProcessing,
@@ -94,7 +102,8 @@ internal class ComputationalRawCaptureCoordinator(
         active = state
 
         reader.setOnImageAvailableListener({ source ->
-            val image = runCatching { source.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
+            val image = runCatching { source.acquireNextImage() }.getOrNull()
+                ?: return@setOnImageAvailableListener
             val payload = try {
                 RawFrameStager.stage(image, scratchDir)
             } catch (error: Throwable) {
@@ -134,6 +143,7 @@ internal class ComputationalRawCaptureCoordinator(
                             surface = reader.surface,
                             characteristics = captureCharacteristics,
                             previewResult = latestPreviewResult,
+                            settings = settings,
                         )
                         session.captureBurst(
                             requests,
@@ -221,6 +231,7 @@ internal class ComputationalRawCaptureCoordinator(
         surface: android.view.Surface,
         characteristics: CameraCharacteristics,
         previewResult: TotalCaptureResult?,
+        settings: PhotoLensSettings,
     ): List<CaptureRequest> {
         val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?: intArrayOf()
@@ -233,7 +244,7 @@ internal class ComputationalRawCaptureCoordinator(
             ?: exposureRange?.lower?.coerceAtLeast(DEFAULT_EXPOSURE_NS)
             ?: DEFAULT_EXPOSURE_NS
         val iso = if (isoRange != null) previewIso.coerceIn(isoRange.lower, isoRange.upper) else previewIso
-        val exposure = if (exposureRange != null) {
+        val baseExposure = if (exposureRange != null) {
             previewExposure.coerceIn(exposureRange.lower, exposureRange.upper)
         } else {
             previewExposure
@@ -245,11 +256,25 @@ internal class ComputationalRawCaptureCoordinator(
             .get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES)
             ?: intArrayOf()
 
-        return List(FRAME_COUNT) {
+        val hdr = settings.hdrEnabled ?: true
+        val strength = (settings.hdrStrength ?: 0.72f).coerceIn(0f, 2f)
+        val offsets = if (hdr && manual) {
+            listOf(-2.0f * strength, -1.0f * strength, 0f, 0f)
+        } else {
+            List(FRAME_COUNT) { 0f }
+        }
+
+        return offsets.map { ev ->
             camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                 if (manual) {
+                    val requestedExposure = (baseExposure.toDouble() * 2.0.pow(ev.toDouble())).toLong()
+                    val exposure = if (exposureRange != null) {
+                        requestedExposure.coerceIn(exposureRange.lower, exposureRange.upper)
+                    } else {
+                        requestedExposure.coerceAtLeast(1L)
+                    }
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                     set(CaptureRequest.SENSOR_SENSITIVITY, iso)
                     set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
@@ -307,12 +332,25 @@ internal class ComputationalRawCaptureCoordinator(
         state.onProcessing(frames.size)
         imageHandler.post {
             try {
-                val fused = RawBurstFusion.fuse(frames, state.characteristics, scratchDir)
+                val fused = NativeComputationalRawEngine.process(
+                    frames = frames,
+                    characteristics = state.characteristics,
+                    settings = state.settings,
+                    outputDirectory = scratchDir,
+                )
                 try {
+                    val description = buildString {
+                        append("Camera native computational DNG")
+                        append(" · frames=${frames.size}")
+                        append(" · hdr=${state.settings.hdrEnabled ?: true}")
+                        append(" · saturation=${state.settings.saturation ?: 1f}")
+                        append(" · sharpness=${state.settings.sharpness ?: 0.28f}")
+                        append(" · upscale=${state.settings.upscaleFactor ?: 1f}x")
+                    }
                     val uri = FusedDngWriter.save(
                         context = appContext,
                         fused = fused,
-                        description = "Camera computational RAW",
+                        description = description,
                     )
                     if (isActive(state)) {
                         active = null
@@ -324,7 +362,7 @@ internal class ComputationalRawCaptureCoordinator(
             } catch (error: Throwable) {
                 if (isActive(state)) {
                     active = null
-                    state.onError(error.message ?: "Computational RAW processing failed")
+                    state.onError(error.message ?: "Native computational RAW processing failed")
                 }
             } finally {
                 frames.forEach { it.file.delete() }
@@ -400,6 +438,7 @@ internal class ComputationalRawCaptureCoordinator(
         val generation: Long,
         val lens: ValuableLens,
         val characteristics: CameraCharacteristics,
+        val settings: PhotoLensSettings,
         val reader: ImageReader,
         val onAcquisitionFinished: () -> Unit,
         val onProcessing: (Int) -> Unit,
