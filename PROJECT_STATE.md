@@ -1,96 +1,131 @@
 # Project State
 
-## Current Phase
+## Current Direction
 
-Phase 1 hardware discovery is validated enough to support active Phase 2/3 camera and RAW-photo work on `phase/01-foundation-discovery`.
+The strict RAW specification is authoritative for still photography.
 
-## Implemented and CI-validated
+Normal PHOTO capture must be:
 
-- App name `Camera` with Compose shell.
-- Official Gradle 9.5 wrapper and Android CI.
-- Public Camera2 metadata enumeration.
-- Logical/physical camera route graph.
-- RAW/JPEG/HEIC/YUV/PRIVATE/high-speed capability discovery where exposed.
-- Valuable-lens filtering without hard-coded numeric camera IDs.
-- SnapCam-compatible development identity for vendor auxiliary-camera exposure.
-- Camera route open/session probing.
-- Lens Manager: visibility, order, role, custom name and custom zoom label.
-- Persistent lens configuration.
-- Real Camera2 live preview.
-- Rear/front lens switching using only valuable photographic routes.
-- Camera ownership recovery when another camera application temporarily takes the device.
-- Sharp `1:1` preview by cropping a high-quality native stream rather than enlarging a tiny square stream.
-- Camera-wide Photo composition aspect: default `4:3`, optional `1:1` and `16:9`; the selected aspect persists across every lens and facing.
-- Unmirrored front preview.
-- Tap-to-focus and AF/AE metering regions.
-- Pinch zoom using Camera2 zoom ratio or crop fallback.
-- Computational RAW processing module separated from Camera2 session ownership.
-- File-backed RAW16 staging with row/pixel-stride handling.
-- Sensor-timestamp pairing between RAW images and capture metadata.
-- Dynamic black-level use when available with static-black-level fallback.
-- Four-frame constant-exposure RAW acquisition foundation.
-- Physical-camera capture-result selection for auxiliary lenses when Android exposes it.
-- Conservative Bayer-safe RAW alignment, motion rejection and robust multi-frame fusion.
-- Fused native-resolution Bayer master output.
-- Fused computational DNG writing through `DngCreator`.
-- Primary shutter now chooses the computational RAW path whenever the selected lens exposes Camera2 RAW capability.
-- JPEG capture remains only an explicit compatibility fallback for lenses without a public RAW path.
-- Preview is restored after RAW acquisition while fusion/DNG writing continues on the processing thread.
+`one shutter press -> one genuine RAW_SENSOR exposure -> one native DNG`
 
-Latest green RAW-first integration CI:
-- head: `b42a2b84360e35aea9707a65bb9506fb006de11f`
-- GitHub Actions run: `32353822467`
-- unit tests: PASS
-- lint: PASS
-- debug APK assembly: PASS
-- artifact upload: PASS
+No rendered photographic companion is persisted.
 
-## Important current boundary
+The selected photo composition aspect is camera-wide, defaults to `4:3`, and remains selected across every lens/facing.
 
-The computational RAW foundation is **not yet the finished flagship photo pipeline**.
+## Important correction
 
-Implemented now:
-`RAW burst -> timestamp/result pairing -> black-level normalization -> Bayer-safe alignment -> motion rejection -> robust fusion -> fused Bayer master -> DNG`
+A recent experimental branch step introduced four-frame RAW fusion and a computational DNG path. That path conflicts with the authoritative strict-RAW specification and must not be treated as the production photo architecture.
 
-Still to implement before calling the Photo pipeline complete:
-- better reference-frame scoring using focus/motion/highlight/SNR signals,
-- gyro-assisted initialization,
-- local/tile alignment,
-- sub-pixel alignment,
-- rolling-shutter-aware correction where necessary,
-- stronger noise-model-aware fusion,
-- optional residual RAW denoiser,
-- genuine multi-frame super-resolution using real sub-pixel observations,
-- high-quality demosaic,
-- white balance and sensor-to-working-space color calibration,
-- lens correction,
-- local HDR/tone mapping,
-- skin/semantic safeguards,
-- texture/sharpening/color profiles,
-- final HEIC/JPEG/Ultra HDR renderer generated from the fused RAW master.
+Production still-photo rules:
+- no RAW averaging,
+- no HDR RAW merge,
+- no multi-frame denoise,
+- no frame stacking,
+- no RAW super-resolution,
+- no sharpening/texture/tone mapping of Bayer values,
+- no JPEG/HEIC/PNG photographic companion,
+- no fake RAW on lenses that do not expose RAW_SENSOR,
+- one native RAW exposure per normal shutter press.
 
-DNG is the RAW master/sidecar, not the final rendered photo. The global `1:1 / 4:3 / 16:9` composition should crop the processed output while preserving the full sensor Bayer data in DNG.
+The experimental fusion code must be removed from the production shutter path or isolated for a future separate rendered/computational mode that does not masquerade as untouched RAW.
 
-## Next work
+## Native performance requirement
 
-1. Real-device validate the new four-frame RAW acquisition and DNG output on every RAW-capable valuable lens.
-2. Add RAW acquisition diagnostics: frame count, timestamps, exposure/ISO consistency, physical route, dimensions and failure reason.
-3. Upgrade fusion from global Bayer-safe translation to local/sub-pixel alignment.
-4. Build the processed-photo renderer from the fused RAW master.
-5. Add genuine MFSR only after sub-pixel evidence and confidence checks are reliable.
-6. Then add adaptive HDR/Night capture planning on top of the same RAW primitives.
+Kotlin/Compose is the UI and orchestration layer only.
 
-## Later work
+Performance-critical camera and media work is moving toward a native engine, primarily C++ with:
+- Android NDK camera interfaces where practical,
+- AImageReader/AHardwareBuffer-oriented buffer handling where practical,
+- zero/minimal-copy pipelines,
+- bounded native worker queues,
+- ARM NEON SIMD,
+- Vulkan compute where profiling proves a win,
+- native metadata/calibration math,
+- native DNG validation/writing strategy,
+- native video frame processing,
+- native container/bitstream control where feasible.
 
-- HEIC / Ultra HDR final output.
-- Pro controls.
-- Video engine.
-- Portrait / Night / Slo-mo / Panorama / Time-lapse / Long Exposure / Astro.
-- iOS-26 interaction polish and smooth lens-switch animation.
-- Device tuning, thermal policy and release hardening.
+Android APIs/HAL remain unavoidable for legal non-root access to camera hardware, permissions, surfaces, storage integration, and some device hardware codecs. They are transport/control boundaries, not the owner of our photographic rendering decisions.
+
+## Still-photo target
+
+`Sensor -> RAW_SENSOR -> exact Image/CaptureResult pairing -> untouched CFA samples + complete metadata -> standards-compliant DNG -> one saved photo`
+
+Capture intelligence may analyze preview/YUV data for exposure, focus, motion, highlight protection, AWB assistance, histogram, zebras and focus peaking. None of that may alter the saved Bayer samples.
+
+DNG metadata must preserve/validate, per physical lens where available:
+- native RAW dimensions,
+- CFA arrangement,
+- black level and dynamic black level,
+- white level,
+- exposure/ISO,
+- focal length/aperture/focus distance,
+- neutral color point,
+- ColorMatrix1/2,
+- ForwardMatrix1/2,
+- CalibrationTransform1/2,
+- ReferenceIlluminant1/2,
+- noise profile,
+- lens shading information,
+- crop/active-array metadata,
+- orientation,
+- physical camera identity.
+
+## DNG ownership
+
+Start from the most standards-correct implementation and verify the resulting TIFF/DNG structure. Long-term, final-file ownership should not depend on Android rendering decisions.
+
+If Android DngCreator limits required metadata/control, move to a native standards-compliant DNG writer. Do not ship a half-correct custom TIFF/DNG implementation merely to remove an API dependency. Native sample integrity and compatibility with Lightroom/ACR/darktable/RawTherapee are higher priority than ideological API removal.
+
+## Video direction
+
+Video is separate from the strict RAW-still rule.
+
+Target architecture:
+- Android/NDK camera layer obtains the best real sensor/ISP stream the device publicly exposes,
+- our native pipeline owns frame processing, color/tone decisions, stabilization logic, scaling policy, timestamps and fallback decisions,
+- software/native codec path provides maximum bitstream/rate-control ownership where practical,
+- hardware codec path may exist as an explicit performance mode when the user prefers efficiency,
+- our own muxing/container layer is preferred where practical,
+- never claim RAW video, native 10-bit, native 4K, native HDR or native high FPS when the HAL did not actually deliver it.
+
+A normal non-root Android application cannot bypass the vendor camera HAL/kernel. Full RAW video is only possible when the hardware/HAL exposes a RAW stream at the required frame rate and bandwidth.
+
+## Already implemented / useful foundation
+
+- App name `Camera`.
+- Gradle/Android CI.
+- Public Camera2 capability discovery.
+- Logical/physical route graph.
+- Valuable-lens filtering.
+- route open/session probing.
+- Lens Manager and persistent lens ordering/labels.
+- real Camera2 preview.
+- rear/front lens switching.
+- camera ownership recovery.
+- sharp square preview handling.
+- global photo aspect with `4:3` default.
+- tap-to-focus / AF/AE metering.
+- pinch zoom.
+- RAW capability/resolution metadata foundation.
+
+## Immediate correction work
+
+1. Remove the experimental multi-frame fusion path from the production shutter.
+2. Restore strict single-exposure RAW_SENSOR -> DNG capture.
+3. Ensure RAW-only lens filtering in RAW/PHOTO mode.
+4. Add robust image/result pairing and timeout cleanup.
+5. Add native RAW metadata/calibration structures.
+6. Add DNG inspection/validation tooling and automated integrity tests.
+7. Add the native C++ core and move hot buffer/metadata/video work out of Kotlin.
+8. Real-device validate every RAW-capable physical lens.
+9. Only after still-RAW integrity is proven, build the native video pipeline.
 
 ## Non-negotiable quality rules
 
-- Never use JPEG/YUV as the computational master when a trustworthy RAW path is available.
-- Never label interpolation/upscaling as true sensor resolution or true multi-frame super-resolution.
-- Never mark a mode complete until its underlying camera path is implemented and physically validated.
+- Preserve photons and sensor measurements before aesthetics.
+- Never fake unsupported RAW, resolution, FPS, HDR, bit depth or lens capability.
+- Never alter Bayer samples merely to make a DNG look prettier in a gallery.
+- Never call processed RGB sensor RAW.
+- Never use interpolation as claimed sensor resolution.
+- Never mark a mode complete until code, CI and real-device behavior are validated.
