@@ -216,7 +216,7 @@ internal class Camera2PreviewController(
                 val characteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
                 val afModes = characteristics
                     .get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-                    .orEmpty()
+                    ?: intArrayOf()
                 when {
                     afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
