@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -18,6 +19,7 @@ import android.os.Looper
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.ViewTreeObserver
 import com.camera.core.model.ValuableLens
 import java.util.concurrent.Executor
 import kotlin.math.abs
@@ -28,9 +30,14 @@ import kotlin.math.min
  * Camera2 preview owner for the live camera screen.
  *
  * It owns exactly one CameraDevice/CameraCaptureSession at a time, can route a preview Surface to a
- * public physical member, and chooses the preview buffer from the user's composition aspect. The
- * size policy is intentionally close to the previous Universal-Camera implementation: aspect
- * accuracy first, then a ~1280 px long edge to keep preview latency/ISP load low on weak devices.
+ * public physical member, and chooses a high quality preview buffer for the requested composition.
+ * Square composition deliberately crops a normal sensor-ratio stream instead of selecting tiny
+ * vendor 1:1 streams, which prevents the soft/blurry square preview seen on some Xiaomi/QTI HALs.
+ *
+ * Camera ownership is also treated as transient. If another higher-priority camera client takes the
+ * device, this controller releases stale resources and reopens when CameraManager reports the camera
+ * available again. Window-focus loss closes the camera proactively so normal app switching does not
+ * leave a frozen TextureView behind.
  */
 internal class Camera2PreviewController(
     context: Context,
@@ -44,6 +51,7 @@ internal class Camera2PreviewController(
     private val executor = Executor { command -> handler.post(command) }
 
     private var textureView: TextureView? = null
+    private var focusListenerView: TextureView? = null
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var previewSurface: Surface? = null
@@ -52,6 +60,45 @@ internal class Camera2PreviewController(
     private var pendingAspect: Float? = 4f / 3f
     private var opening = false
     private var released = false
+
+    private val windowFocusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+        handler.post {
+            if (released) return@post
+            if (hasFocus) {
+                reopenIfPossible()
+            } else {
+                // A camera app should not keep the device while its window is no longer active.
+                // Closing here also prevents the last TextureView frame from looking permanently
+                // frozen when another camera app is launched.
+                closeCamera()
+                emit(PreviewState.Idle)
+            }
+        }
+    }
+
+    private val availabilityCallback = object : CameraManager.AvailabilityCallback() {
+        override fun onCameraAvailable(cameraId: String) {
+            val lens = pendingLens ?: return
+            if (lens.cameraId != cameraId || released) return
+            reopenIfPossible()
+        }
+
+        override fun onCameraUnavailable(cameraId: String) {
+            val lens = pendingLens ?: return
+            if (
+                lens.cameraId == cameraId &&
+                cameraDevice == null &&
+                !opening &&
+                textureView?.hasWindowFocus() == true
+            ) {
+                emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
+            }
+        }
+    }
+
+    init {
+        cameraManager.registerAvailabilityCallback(executor, availabilityCallback)
+    }
 
     fun bind(
         view: TextureView,
@@ -62,6 +109,7 @@ internal class Camera2PreviewController(
         textureView = view
         pendingLens = lens
         pendingAspect = targetAspect
+        installWindowFocusListener(view)
 
         if (view.surfaceTextureListener !== surfaceListener) {
             view.surfaceTextureListener = surfaceListener
@@ -77,7 +125,7 @@ internal class Camera2PreviewController(
             return
         }
 
-        if (view.isAvailable && lens != null) {
+        if (view.isAvailable && lens != null && view.hasWindowFocus()) {
             open(lens, targetAspect)
         } else if (lens == null) {
             closeCamera()
@@ -88,15 +136,36 @@ internal class Camera2PreviewController(
     fun release() {
         if (released) return
         released = true
+        runCatching { cameraManager.unregisterAvailabilityCallback(availabilityCallback) }
+        removeWindowFocusListener()
         closeCamera()
         textureView?.surfaceTextureListener = null
         textureView = null
         thread.quitSafely()
     }
 
+    private fun installWindowFocusListener(view: TextureView) {
+        if (focusListenerView === view) return
+        removeWindowFocusListener()
+        if (view.viewTreeObserver.isAlive) {
+            view.viewTreeObserver.addOnWindowFocusChangeListener(windowFocusListener)
+            focusListenerView = view
+        }
+    }
+
+    private fun removeWindowFocusListener() {
+        val view = focusListenerView ?: return
+        if (view.viewTreeObserver.isAlive) {
+            runCatching {
+                view.viewTreeObserver.removeOnWindowFocusChangeListener(windowFocusListener)
+            }
+        }
+        focusListenerView = null
+    }
+
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-            pendingLens?.let { lens -> open(lens, pendingAspect) }
+            reopenIfPossible()
         }
 
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
@@ -107,10 +176,19 @@ internal class Camera2PreviewController(
 
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
             closeCamera()
+            emit(PreviewState.Idle)
             return true
         }
 
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    }
+
+    private fun reopenIfPossible() {
+        if (released || opening || cameraDevice != null) return
+        val view = textureView ?: return
+        val lens = pendingLens ?: return
+        if (!view.isAvailable || !view.isAttachedToWindow || !view.hasWindowFocus()) return
+        open(lens, pendingAspect)
     }
 
     @SuppressLint("MissingPermission")
@@ -118,6 +196,7 @@ internal class Camera2PreviewController(
         if (released) return
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
+        if (!view.isAttachedToWindow || !view.hasWindowFocus()) return
         val key = lensKey(lens, targetAspect)
 
         if (key == activeLensKey && (opening || cameraDevice != null)) return
@@ -144,7 +223,11 @@ internal class Camera2PreviewController(
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         opening = false
-                        if (released || activeLensKey != key) {
+                        if (
+                            released ||
+                            activeLensKey != key ||
+                            textureView?.hasWindowFocus() != true
+                        ) {
                             camera.close()
                             return
                         }
@@ -153,17 +236,19 @@ internal class Camera2PreviewController(
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
-                        opening = false
-                        if (cameraDevice === camera) cameraDevice = null
-                        camera.close()
-                        emit(PreviewState.Error("Camera disconnected"))
+                        handleRecoverableCameraLoss(camera, lens)
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
-                        opening = false
-                        if (cameraDevice === camera) cameraDevice = null
-                        camera.close()
-                        emit(PreviewState.Error("Camera open error $error"))
+                        if (isRecoverableDeviceError(error)) {
+                            handleRecoverableCameraLoss(camera, lens)
+                        } else {
+                            opening = false
+                            if (cameraDevice === camera) cameraDevice = null
+                            runCatching { camera.close() }
+                            closeCamera()
+                            emit(PreviewState.Error(cameraErrorMessage(error)))
+                        }
                     }
                 },
                 handler,
@@ -171,7 +256,59 @@ internal class Camera2PreviewController(
         }.onFailure { error ->
             opening = false
             closeCamera()
-            emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            if (isRecoverableOpenFailure(error)) {
+                markWaitingForCamera(lens)
+            } else {
+                emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            }
+        }
+    }
+
+    private fun handleRecoverableCameraLoss(camera: CameraDevice, lens: ValuableLens) {
+        opening = false
+        if (cameraDevice === camera) cameraDevice = null
+        runCatching { camera.close() }
+        closeCamera()
+        markWaitingForCamera(lens)
+    }
+
+    private fun markWaitingForCamera(lens: ValuableLens) {
+        if (
+            !released &&
+            pendingLens?.id == lens.id &&
+            textureView?.hasWindowFocus() == true
+        ) {
+            // Keep this as Opening rather than Error. CameraManager.AvailabilityCallback will reopen
+            // automatically when the competing camera client releases the device.
+            emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
+        } else {
+            emit(PreviewState.Idle)
+        }
+    }
+
+    private fun isRecoverableDeviceError(error: Int): Boolean = when (error) {
+        CameraDevice.StateCallback.ERROR_CAMERA_IN_USE,
+        CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE,
+        CameraDevice.StateCallback.ERROR_CAMERA_DEVICE,
+        -> true
+        else -> false
+    }
+
+    private fun cameraErrorMessage(error: Int): String = when (error) {
+        CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "Camera disabled by device policy"
+        CameraDevice.StateCallback.ERROR_CAMERA_SERVICE -> "Android camera service error"
+        else -> "Camera open error $error"
+    }
+
+    private fun isRecoverableOpenFailure(error: Throwable): Boolean {
+        if (error !is CameraAccessException) return false
+        return when (error.reason) {
+            CameraAccessException.CAMERA_DISCONNECTED,
+            CameraAccessException.CAMERA_IN_USE,
+            CameraAccessException.MAX_CAMERAS_IN_USE,
+            CameraAccessException.CAMERA_ERROR,
+            -> true
+            else -> false
         }
     }
 
@@ -193,7 +330,11 @@ internal class Camera2PreviewController(
                 executor,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        if (cameraDevice !== camera || released) {
+                        if (
+                            cameraDevice !== camera ||
+                            released ||
+                            textureView?.hasWindowFocus() != true
+                        ) {
                             session.close()
                             return
                         }
@@ -218,7 +359,12 @@ internal class Camera2PreviewController(
             )
             camera.createCaptureSession(sessionConfig)
         }.onFailure { error ->
-            emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            if (isRecoverableOpenFailure(error)) {
+                closeCamera()
+                markWaitingForCamera(lens)
+            } else {
+                emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            }
         }
     }
 
@@ -254,7 +400,12 @@ internal class Camera2PreviewController(
                 ),
             )
         }.onFailure { error ->
-            emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            if (isRecoverableOpenFailure(error)) {
+                closeCamera()
+                markWaitingForCamera(lens)
+            } else {
+                emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            }
         }
     }
 
@@ -272,9 +423,12 @@ internal class Camera2PreviewController(
     }
 
     /**
-     * Prefer the exact requested composition ratio, then a long edge close to 1280 pixels. This is
-     * the same low-latency policy that behaved well in the previous camera app and avoids wasting
-     * memory/bandwidth on a huge preview Surface that does not improve captured quality.
+     * Select a preview stream for the composition without sacrificing sharpness.
+     *
+     * 1:1 is a composition crop, not a reason to request a native square Camera2 stream. A number
+     * of OEM HALs expose square PRIVATE sizes only at low resolution (for example 640x640), which
+     * looks visibly soft once stretched across a modern display. For square mode we therefore use
+     * the sensor's normal aspect (typically 4:3), prefer >= ~1 MP, and crop to 1:1 in the TextureView.
      */
     private fun choosePreviewSize(
         characteristics: CameraCharacteristics,
@@ -287,28 +441,40 @@ internal class Camera2PreviewController(
             ?.distinctBy { "${it.width}x${it.height}" }
             .orEmpty()
 
-        val requestedAspect = targetAspect
+        val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val sensorAspect = active
+            ?.let { landscapeAspect(it.width().toFloat() / it.height().toFloat()) }
+            ?: 4f / 3f
+        val compositionAspect = targetAspect
             ?.takeIf { it.isFinite() && it > 0f }
             ?.let(::landscapeAspect)
-            ?: run {
-                val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                active?.let { landscapeAspect(it.width().toFloat() / it.height().toFloat()) }
-                    ?: 4f / 3f
-            }
+            ?: sensorAspect
+        val squareComposition = abs(compositionAspect - 1f) < 0.03f
+        val streamAspect = if (squareComposition) sensorAspect else compositionAspect
+        val targetLongEdge = if (squareComposition) 1440 else 1280
 
         if (sizes.isEmpty()) {
-            return if (requestedAspect > 1.55f) Size(1280, 720) else Size(1280, 960)
+            return when {
+                streamAspect > 1.55f -> Size(1280, 720)
+                squareComposition -> Size(1440, 1080)
+                else -> Size(1280, 960)
+            }
         }
 
         val bounded = sizes.filter {
-            max(it.width, it.height) <= 1440 && pixels(it) <= 1_800_000L
+            max(it.width, it.height) <= 1920 && pixels(it) <= 2_100_000L
         }.ifEmpty { sizes }
+        val qualityCandidates = if (squareComposition) {
+            bounded.filter { pixels(it) >= 900_000L }.ifEmpty { bounded }
+        } else {
+            bounded
+        }
 
-        return bounded.minWithOrNull(
+        return qualityCandidates.minWithOrNull(
             compareBy<Size> {
-                abs(sizeAspect(it) - requestedAspect)
+                abs(sizeAspect(it) - streamAspect)
             }.thenBy {
-                abs(max(it.width, it.height) - 1280)
+                abs(max(it.width, it.height) - targetLongEdge)
             }.thenByDescending(::pixels),
         ) ?: sizes.first()
     }
@@ -351,8 +517,9 @@ internal class Camera2PreviewController(
             Surface.ROTATION_180 -> matrix.postRotate(180f, centerX, centerY)
         }
 
-        // Square is not exposed as a PRIVATE stream on many HALs. When the closest stream has a
-        // different ratio, correct the default TextureView stretch and center-crop the excess.
+        // Correct TextureView's implicit stretch and center-crop the stream to the selected visible
+        // composition. In 1:1 this crops the high-resolution native sensor preview rather than
+        // enlarging a low-resolution square stream.
         if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180) {
             val sourceAspect = sizeAspect(size)
             val requested = targetAspect
