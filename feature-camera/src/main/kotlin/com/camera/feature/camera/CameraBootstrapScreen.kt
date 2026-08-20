@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -69,14 +71,15 @@ fun CameraBootstrapScreen() {
     val context = LocalContext.current
     val catalog = remember(context) { AndroidCameraCatalog(context) }
     val lensStore = remember(context) { LensConfigStore(context) }
-    val uiPrefs = remember(context) {
-        context.getSharedPreferences("camera_ui", Context.MODE_PRIVATE)
-    }
+    val uiPrefs = remember(context) { context.getSharedPreferences("camera_ui", Context.MODE_PRIVATE) }
     val storedConfigs by lensStore.configs.collectAsStateWithLifecycle(initialValue = emptyMap())
 
     var snapshot by remember { mutableStateOf<CameraCatalogSnapshot?>(null) }
     var discoveryError by remember { mutableStateOf<String?>(null) }
     var previewState by remember { mutableStateOf<PreviewState>(PreviewState.Idle) }
+    var zoomState by remember { mutableStateOf(ZoomState()) }
+    var focusPoint by remember { mutableStateOf<FocusPoint?>(null) }
+    var captureState by remember { mutableStateOf<PhotoCaptureState>(PhotoCaptureState.Idle) }
     var lensManagerOpen by remember { mutableStateOf(false) }
     var aspectMenuOpen by remember { mutableStateOf(false) }
     var selectedLensId by remember { mutableStateOf<String?>(null) }
@@ -97,6 +100,20 @@ fun CameraBootstrapScreen() {
         )
     }
 
+    val controller = remember(context) {
+        Camera2PreviewController(
+            context = context,
+            onState = { previewState = it },
+            onZoomState = { zoomState = it },
+            onFocusPoint = { focusPoint = it },
+            onCaptureState = { captureState = it },
+        )
+    }
+
+    DisposableEffect(controller) {
+        onDispose { controller.release() }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> cameraPermissionGranted = granted }
@@ -105,8 +122,6 @@ fun CameraBootstrapScreen() {
         if (!cameraPermissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    // Metadata discovery stays separate from the live session. Probing every route while preview is
-    // opening can contend with vendor camera services, especially Xiaomi/QTI implementations.
     LaunchedEffect(cameraPermissionGranted) {
         if (!cameraPermissionGranted) return@LaunchedEffect
         discoveryError = null
@@ -147,6 +162,8 @@ fun CameraBootstrapScreen() {
             selectedLensId = selectedLens.id.value
         }
         aspectMenuOpen = false
+        focusPoint = null
+        captureState = PhotoCaptureState.Idle
         val lensKey = selectedLens?.id?.value ?: return@LaunchedEffect
         selectedAspect = runCatching {
             PhotoAspect.valueOf(
@@ -161,26 +178,39 @@ fun CameraBootstrapScreen() {
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
             Box(Modifier.fillMaxSize()) {
-                // The viewfinder itself owns the selected composition geometry. 4:3 is therefore a
-                // true 3:4 portrait frame, 16:9 is a true 9:16 frame, and Square is 1:1.
                 Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) {
                     if (cameraPermissionGranted && selectedLens != null) {
-                        CameraPreview(
-                            lens = selectedLens,
-                            targetAspect = selectedAspect.ratio,
-                            onState = { previewState = it },
+                        BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .aspectRatio(1f / selectedAspect.ratio)
                                 .clipToBounds(),
-                        )
+                        ) {
+                            CameraPreview(
+                                controller = controller,
+                                lens = selectedLens,
+                                targetAspect = selectedAspect.ratio,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+
+                            focusPoint?.let { point ->
+                                Box(
+                                    modifier = Modifier
+                                        .offset(
+                                            x = maxWidth * point.x - 22.dp,
+                                            y = maxHeight * point.y - 22.dp,
+                                        )
+                                        .size(44.dp)
+                                        .border(1.5.dp, CameraYellow, RoundedCornerShape(7.dp)),
+                                )
+                            }
+                        }
                     }
                 }
 
-                // Minimal readability scrim. Do not hide or wash out the live viewfinder.
                 Box(
                     Modifier
                         .fillMaxSize()
@@ -203,9 +233,7 @@ fun CameraBootstrapScreen() {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         GlassChip("⚡")
-                        GlassChip(selectedAspect.label) {
-                            aspectMenuOpen = !aspectMenuOpen
-                        }
+                        GlassChip(selectedAspect.label) { aspectMenuOpen = !aspectMenuOpen }
                         GlassChip("•••") {
                             if (snapshot?.valuableLenses?.isNotEmpty() == true) lensManagerOpen = true
                         }
@@ -217,15 +245,13 @@ fun CameraBootstrapScreen() {
                         snapshot = snapshot,
                         discoveryError = discoveryError,
                         previewState = previewState,
+                        captureState = captureState,
                         permissionGranted = cameraPermissionGranted,
                         onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
                     )
 
                     Spacer(Modifier.weight(1f))
 
-                    // Like a normal phone camera, only the lenses for the active facing belong in
-                    // the zoom strip. Front cameras are reached through the flip button, not mixed
-                    // into the rear 0.6x/1x/tele controls.
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -238,19 +264,36 @@ fun CameraBootstrapScreen() {
                         } else {
                             facingLenses.forEach { lens ->
                                 val config = storedConfigs[lens.id.value]
-                                LensPill(
-                                    text = ZoomLabel.resolve(
+                                val baseAnchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor
+                                val selected = lens.id.value == selectedLens?.id?.value
+                                val label = if (selected && zoomState.ratio > 1.015f && baseAnchor != null) {
+                                    ZoomLabel.formatAnchor(baseAnchor * zoomState.ratio)
+                                } else {
+                                    ZoomLabel.resolve(
                                         customLabel = config?.customZoomLabel,
-                                        numericAnchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor,
-                                    ),
-                                    selected = lens.id.value == selectedLens?.id?.value,
+                                        numericAnchor = baseAnchor,
+                                    )
+                                }
+                                LensPill(
+                                    text = label,
+                                    selected = selected,
                                     onClick = { selectedLensId = lens.id.value },
                                 )
                             }
                         }
                     }
 
-                    Spacer(Modifier.height(20.dp))
+                    if (zoomState.maxRatio > 1.05f) {
+                        Spacer(Modifier.height(7.dp))
+                        Text(
+                            text = "Pinch to zoom",
+                            color = Color.White.copy(alpha = 0.55f),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+
+                    Spacer(Modifier.height(16.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -260,15 +303,41 @@ fun CameraBootstrapScreen() {
                         Box(
                             Modifier
                                 .size(48.dp)
-                                .background(Color.White.copy(alpha = 0.14f), RoundedCornerShape(14.dp)),
-                        )
+                                .background(
+                                    if (captureState is PhotoCaptureState.Saved) {
+                                        Color.White.copy(alpha = 0.22f)
+                                    } else {
+                                        Color.White.copy(alpha = 0.14f)
+                                    },
+                                    RoundedCornerShape(14.dp),
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (captureState is PhotoCaptureState.Saved) {
+                                Text("✓", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
 
+                        val shutterReady = previewState is PreviewState.Streaming &&
+                            captureState !is PhotoCaptureState.Capturing &&
+                            captureState !is PhotoCaptureState.Saving
                         Box(
                             Modifier
                                 .size(82.dp)
                                 .border(5.dp, Color.White, CircleShape)
                                 .padding(6.dp)
-                                .background(Color.White, CircleShape),
+                                .background(
+                                    if (captureState is PhotoCaptureState.Capturing) {
+                                        Color.White.copy(alpha = 0.55f)
+                                    } else {
+                                        Color.White
+                                    },
+                                    CircleShape,
+                                )
+                                .clickable(enabled = shutterReady) {
+                                    captureState = PhotoCaptureState.Capturing
+                                    controller.capturePhoto(selectedAspect.ratio)
+                                },
                         )
 
                         Box(
@@ -303,6 +372,7 @@ fun CameraBootstrapScreen() {
                         onSelect = { aspect ->
                             selectedAspect = aspect
                             aspectMenuOpen = false
+                            focusPoint = null
                             val lensKey = selectedLens?.id?.value
                             uiPrefs.edit()
                                 .putString("default_photo_aspect", aspect.name)
@@ -330,14 +400,11 @@ fun CameraBootstrapScreen() {
 
 @Composable
 private fun CameraPreview(
+    controller: Camera2PreviewController,
     lens: ValuableLens,
     targetAspect: Float,
-    onState: (PreviewState) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val context = LocalContext.current
-    val controller = remember(context) { Camera2PreviewController(context, onState) }
-
     AndroidView(
         factory = { viewContext ->
             TextureView(viewContext).apply {
@@ -348,10 +415,6 @@ private fun CameraPreview(
         modifier = modifier,
         update = { view -> controller.bind(view, lens, targetAspect) },
     )
-
-    DisposableEffect(controller) {
-        onDispose { controller.release() }
-    }
 }
 
 @Composable
@@ -394,6 +457,7 @@ private fun CameraStatus(
     snapshot: CameraCatalogSnapshot?,
     discoveryError: String?,
     previewState: PreviewState,
+    captureState: PhotoCaptureState,
     permissionGranted: Boolean,
     onRequestPermission: () -> Unit,
 ) {
@@ -417,6 +481,15 @@ private fun CameraStatus(
                 Text("Preview unavailable", color = Color(0xFFFF8A80), fontSize = 13.sp)
                 Text(previewState.message, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
             }
+        }
+        captureState is PhotoCaptureState.Error -> {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Photo failed", color = Color(0xFFFF8A80), fontSize = 13.sp)
+                Text(captureState.message, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
+            }
+        }
+        captureState is PhotoCaptureState.Saving -> {
+            Text("Saving photo…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
         }
         snapshot == null -> {
             Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
