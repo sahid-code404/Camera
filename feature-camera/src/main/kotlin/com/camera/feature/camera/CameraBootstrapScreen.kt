@@ -1,6 +1,11 @@
 package com.camera.feature.camera
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,21 +38,57 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.camera2.AndroidCameraCatalog
+import com.camera.camera.camera2.scanValidated
 import com.camera.core.model.ZoomLabel
+import com.camera.feature.settings.LensConfigStore
 import kotlin.math.abs
 
 @Composable
 fun CameraBootstrapScreen() {
     val context = LocalContext.current
+    val catalog = remember(context) { AndroidCameraCatalog(context) }
+    val lensStore = remember(context) { LensConfigStore(context) }
+    val storedConfigs by lensStore.configs.collectAsStateWithLifecycle(initialValue = emptyMap())
+
     var snapshot by remember { mutableStateOf<CameraCatalogSnapshot?>(null) }
     var discoveryError by remember { mutableStateOf<String?>(null) }
+    var cameraPermissionGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED,
+        )
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        cameraPermissionGranted = granted
+    }
 
     LaunchedEffect(Unit) {
-        runCatching { AndroidCameraCatalog(context).scan() }
+        // Metadata is useful before permission because it lets diagnostics explain what the HAL says
+        // exists. The stronger session probe runs only after permission is granted.
+        runCatching { catalog.scan() }
             .onSuccess { snapshot = it }
             .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
+        if (!cameraPermissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    LaunchedEffect(cameraPermissionGranted) {
+        if (!cameraPermissionGranted) return@LaunchedEffect
+        discoveryError = null
+        runCatching { catalog.scanValidated(context) }
+            .onSuccess { snapshot = it }
+            .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
+    }
+
+    LaunchedEffect(snapshot?.valuableLenses) {
+        val lenses = snapshot?.valuableLenses.orEmpty()
+        if (lenses.isNotEmpty()) lensStore.reconcile(lenses)
     }
 
     MaterialTheme {
@@ -67,20 +108,31 @@ fun CameraBootstrapScreen() {
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         GlassChip("⚡")
-                        GlassChip("CAMERA2")
+                        GlassChip(if (snapshot?.sessionValidated == true) "VALIDATED" else "CAMERA2")
                         GlassChip("•••")
                     }
 
                     Spacer(Modifier.weight(1f))
 
-                    DiscoveryStatus(snapshot, discoveryError)
+                    DiscoveryStatus(
+                        snapshot = snapshot,
+                        error = discoveryError,
+                        permissionGranted = cameraPermissionGranted,
+                        onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
+                    )
 
                     Spacer(Modifier.weight(1f))
 
-                    val lenses = snapshot?.valuableLenses.orEmpty()
+                    val lenses = snapshot?.valuableLenses
+                        .orEmpty()
+                        .filter { lens -> storedConfigs[lens.id.value]?.visible != false }
+                        .sortedBy { lens -> storedConfigs[lens.id.value]?.position ?: lens.userOrder }
                     val mainIndex = lenses.indexOfFirst { lens ->
-                        lens.displayZoomAnchor?.let { abs(it - 1f) < 0.18f } == true
+                        val config = storedConfigs[lens.id.value]
+                        val anchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor
+                        anchor?.let { abs(it - 1f) < 0.18f } == true
                     }.let { if (it >= 0) it else 0 }
+
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -92,8 +144,12 @@ fun CameraBootstrapScreen() {
                             LensPill("…", selected = true)
                         } else {
                             lenses.forEachIndexed { index, lens ->
+                                val config = storedConfigs[lens.id.value]
                                 LensPill(
-                                    text = ZoomLabel.resolve(null, lens.displayZoomAnchor),
+                                    text = ZoomLabel.resolve(
+                                        customLabel = config?.customZoomLabel,
+                                        numericAnchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor,
+                                    ),
                                     selected = index == mainIndex,
                                 )
                             }
@@ -110,7 +166,7 @@ fun CameraBootstrapScreen() {
                         Box(
                             Modifier
                                 .size(48.dp)
-                                .background(Color.White.copy(alpha = 0.12f), RoundedCornerShape(14.dp))
+                                .background(Color.White.copy(alpha = 0.12f), RoundedCornerShape(14.dp)),
                         )
 
                         Box(
@@ -118,7 +174,7 @@ fun CameraBootstrapScreen() {
                                 .size(82.dp)
                                 .border(5.dp, Color.White, CircleShape)
                                 .padding(6.dp)
-                                .background(Color.White, CircleShape)
+                                .background(Color.White, CircleShape),
                         )
 
                         Box(
@@ -145,7 +201,12 @@ fun CameraBootstrapScreen() {
 }
 
 @Composable
-private fun DiscoveryStatus(snapshot: CameraCatalogSnapshot?, error: String?) {
+private fun DiscoveryStatus(
+    snapshot: CameraCatalogSnapshot?,
+    error: String?,
+    permissionGranted: Boolean,
+    onRequestPermission: () -> Unit,
+) {
     when {
         error != null -> {
             Text("Camera discovery failed", color = Color(0xFFFF8A80), fontSize = 13.sp)
@@ -155,16 +216,41 @@ private fun DiscoveryStatus(snapshot: CameraCatalogSnapshot?, error: String?) {
             Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.76f), fontSize = 13.sp)
             Text("Phase 1 · capability discovery", color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp)
         }
-        else -> {
+        !permissionGranted -> {
             Text(
-                "${snapshot.valuableLenses.size} valuable lenses · ${snapshot.deviceProfiles.size} routes",
+                "${snapshot.deviceProfiles.size} metadata routes found",
+                color = Color.White.copy(alpha = 0.78f),
+                fontSize = 13.sp,
+            )
+            Text(
+                "Grant camera permission to validate lenses",
+                color = Color(0xFFFFD54F),
+                fontSize = 11.sp,
+                modifier = Modifier.clickable(onClick = onRequestPermission),
+            )
+        }
+        snapshot.sessionValidated -> {
+            Text(
+                "${snapshot.valuableLenses.size} valuable lenses · ${snapshot.usableRouteCount} usable routes",
                 color = Color.White.copy(alpha = 0.78f),
                 fontSize = 13.sp,
             )
             val rawCount = snapshot.deviceProfiles.count { it.supportsRaw }
-            val logicalCount = snapshot.deviceProfiles.count { it.supportsLogicalMultiCamera }
+            val failed = snapshot.routeProbeResults.count { !it.usable }
             Text(
-                "$rawCount RAW routes · $logicalCount logical routes",
+                "$rawCount RAW metadata routes · $failed routes rejected by probe",
+                color = Color.White.copy(alpha = 0.46f),
+                fontSize = 11.sp,
+            )
+        }
+        else -> {
+            Text(
+                "${snapshot.valuableLenses.size} candidate lenses · ${snapshot.deviceProfiles.size} routes",
+                color = Color.White.copy(alpha = 0.78f),
+                fontSize = 13.sp,
+            )
+            Text(
+                "Validating Camera2 sessions…",
                 color = Color.White.copy(alpha = 0.46f),
                 fontSize = 11.sp,
             )
