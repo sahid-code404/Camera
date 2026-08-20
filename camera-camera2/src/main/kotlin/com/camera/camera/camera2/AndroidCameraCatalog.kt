@@ -119,10 +119,10 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
         val physicalIds = characteristics.physicalCameraIds
         val oisModes = characteristics
             .get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
-            .orEmpty()
+            ?: intArrayOf()
         val eisModes = characteristics
             .get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
-            .orEmpty()
+            ?: intArrayOf()
 
         val mergedStreams = mergeStreams(
             streamCapabilities(streamMap),
