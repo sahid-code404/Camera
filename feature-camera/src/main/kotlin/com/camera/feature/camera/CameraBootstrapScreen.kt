@@ -58,6 +58,7 @@ import kotlin.math.abs
 
 private val CameraYellow = Color(0xFFFFD60A)
 private val CameraGlass = Color(0xB82C2C2E)
+private const val GLOBAL_PHOTO_ASPECT_KEY = "photo_aspect_global"
 
 /** Landscape composition ratio. The portrait viewfinder displays its reciprocal. */
 private enum class PhotoAspect(val label: String, val ratio: Float) {
@@ -87,8 +88,10 @@ fun CameraBootstrapScreen() {
         mutableStateOf(
             runCatching {
                 PhotoAspect.valueOf(
-                    uiPrefs.getString("default_photo_aspect", PhotoAspect.FOUR_THREE.name)
-                        ?: PhotoAspect.FOUR_THREE.name,
+                    uiPrefs.getString(
+                        GLOBAL_PHOTO_ASPECT_KEY,
+                        uiPrefs.getString("default_photo_aspect", PhotoAspect.FOUR_THREE.name),
+                    ) ?: PhotoAspect.FOUR_THREE.name,
                 )
             }.getOrDefault(PhotoAspect.FOUR_THREE),
         )
@@ -161,18 +164,11 @@ fun CameraBootstrapScreen() {
         if (selectedLens != null && selectedLensId != selectedLens.id.value) {
             selectedLensId = selectedLens.id.value
         }
+        // Composition aspect is intentionally global. Lens/facing changes must never silently
+        // change the user's framing choice.
         aspectMenuOpen = false
         focusPoint = null
         captureState = PhotoCaptureState.Idle
-        val lensKey = selectedLens?.id?.value ?: return@LaunchedEffect
-        selectedAspect = runCatching {
-            PhotoAspect.valueOf(
-                uiPrefs.getString(
-                    "photo_aspect_$lensKey",
-                    uiPrefs.getString("default_photo_aspect", PhotoAspect.FOUR_THREE.name),
-                ) ?: PhotoAspect.FOUR_THREE.name,
-            )
-        }.getOrDefault(PhotoAspect.FOUR_THREE)
     }
 
     MaterialTheme {
@@ -373,12 +369,11 @@ fun CameraBootstrapScreen() {
                             selectedAspect = aspect
                             aspectMenuOpen = false
                             focusPoint = null
-                            val lensKey = selectedLens?.id?.value
                             uiPrefs.edit()
+                                .putString(GLOBAL_PHOTO_ASPECT_KEY, aspect.name)
+                                // Keep the old default key updated for seamless migration from the
+                                // earlier per-lens implementation. No per-lens aspect key is written.
                                 .putString("default_photo_aspect", aspect.name)
-                                .apply {
-                                    if (lensKey != null) putString("photo_aspect_$lensKey", aspect.name)
-                                }
                                 .apply()
                         },
                         modifier = Modifier
@@ -489,7 +484,7 @@ private fun CameraStatus(
             }
         }
         captureState is PhotoCaptureState.Saving -> {
-            Text("Saving photo…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
+            Text("Processing photo…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
         }
         snapshot == null -> {
             Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
