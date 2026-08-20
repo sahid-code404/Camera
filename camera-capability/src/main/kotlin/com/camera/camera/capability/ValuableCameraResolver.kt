@@ -10,10 +10,12 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Converts raw Camera2 routes into useful photographic lenses without relying on numeric camera IDs.
+ * Converts the raw Camera2 graph into user-facing photographic lenses.
  *
- * When [validatedRouteKeys] is supplied, only routes that successfully configured a Camera2 session
- * are eligible. A null set means metadata-only discovery and is intentionally weaker evidence.
+ * Vendor HALs can publish several Camera2 IDs for the same piece of glass, logical aggregators,
+ * physical-member aliases, depth routes and alternate ISP pipelines. The main camera UI must show
+ * useful optical cameras, not raw IDs. This resolver therefore classifies by public capability and
+ * optical fingerprint rather than hard-coded Qualcomm/Xiaomi camera numbers.
  */
 object ValuableCameraResolver {
     data class Resolution(
@@ -27,55 +29,72 @@ object ValuableCameraResolver {
     ): Resolution {
         if (profiles.isEmpty()) return Resolution(emptyList(), emptySet())
 
+        val hidden = mutableSetOf<String>()
         val enumeratedIds = profiles
             .filter { it.routeKind == CameraRouteKind.ENUMERATED }
             .mapTo(mutableSetOf()) { it.routeCameraId }
 
-        val deduplicated = profiles.filterNot { profile ->
-            profile.routeKind == CameraRouteKind.LOGICAL_PHYSICAL_MEMBER &&
-                profile.physicalCameraId in enumeratedIds
+        // If a physical member is also independently enumerated, prefer the direct route. Keeping
+        // both would create two buttons that drive the same sensor on many QTI/Xiaomi HALs.
+        val routeCandidates = profiles.filterNot { profile ->
+            val duplicatePhysicalMember =
+                profile.routeKind == CameraRouteKind.LOGICAL_PHYSICAL_MEMBER &&
+                    profile.physicalCameraId in enumeratedIds
+            if (duplicatePhysicalMember) hidden += routeKey(profile)
+            duplicatePhysicalMember
         }
 
-        val result = mutableListOf<ValuableLens>()
-        val hidden = mutableSetOf<String>()
+        val eligible = routeCandidates.filter { profile ->
+            val photographic = isPhotographicRoute(profile)
+            val validated = validatedRouteKeys == null || routeKey(profile) in validatedRouteKeys
+            if (!photographic || !validated) hidden += routeKey(profile)
+            photographic && validated
+        }.filterNot { profile ->
+            val logicalAggregator = profile.routeKind == CameraRouteKind.ENUMERATED &&
+                profile.supportsLogicalMultiCamera &&
+                profile.logicalPhysicalIds.isNotEmpty() &&
+                routeCandidates.any { it.parentLogicalCameraId == profile.routeCameraId }
+            if (logicalAggregator) hidden += routeKey(profile)
+            logicalAggregator
+        }
 
-        deduplicated.groupBy { it.facing }.forEach { (facing, facingProfiles) ->
-            val photoProfiles = facingProfiles.filter { profile ->
-                val metadataEligible = isPhotographicRoute(profile)
-                val validationEligible = validatedRouteKeys == null || routeKey(profile) in validatedRouteKeys
-                if (!metadataEligible || !validationEligible) hidden += routeKey(profile)
-                metadataEligible && validationEligible
+        // Collapse vendor aliases only when optical metadata strongly indicates the same camera.
+        // Missing metadata keeps a route separate rather than accidentally hiding real hardware.
+        val preferredProfiles = eligible
+            .groupBy { profile -> opticalFingerprint(profile) ?: "route:${routeKey(profile)}" }
+            .values
+            .map { group ->
+                val preferred = group.sortedWith(routePreferenceComparator).first()
+                group.filterNot { routeKey(it) == routeKey(preferred) }
+                    .forEach { duplicate -> hidden += routeKey(duplicate) }
+                preferred
             }
-            val baseEquivalent = chooseBaseEquivalent(facing, photoProfiles)
 
-            photoProfiles.forEach { profile ->
-                val logicalAggregator = profile.routeKind == CameraRouteKind.ENUMERATED &&
-                    profile.supportsLogicalMultiCamera &&
-                    profile.logicalPhysicalIds.isNotEmpty() &&
-                    photoProfiles.any { it.parentLogicalCameraId == profile.routeCameraId }
+        val groupedByFacing = preferredProfiles.groupBy { it.facing }
+        val result = buildList {
+            groupedByFacing.forEach { (facing, facingProfiles) ->
+                val baseEquivalent = chooseBaseEquivalent(facing, facingProfiles)
+                facingProfiles.forEach { profile ->
+                    val equivalent = profile.equivalentFocalLength35Mm
+                    val anchor = if (equivalent != null && baseEquivalent != null && baseEquivalent > 0f) {
+                        (equivalent / baseEquivalent).coerceIn(0.1f, 30f)
+                    } else null
 
-                if (logicalAggregator) {
-                    hidden += routeKey(profile)
-                    return@forEach
+                    add(
+                        ValuableLens(
+                            id = LensStableId(stableId(profile)),
+                            cameraId = profile.routeCameraId,
+                            physicalCameraId = profile.physicalCameraId,
+                            facing = facing,
+                            inferredRole = inferRole(facing, equivalent),
+                            roleConfidence = roleConfidence(facing, equivalent),
+                            focalLengthMm = profile.primaryFocalLengthMm,
+                            sensorWidthMm = profile.sensorWidthMm,
+                            displayZoomAnchor = anchor,
+                            rawSupported = profile.supportsRaw,
+                        ),
+                    )
                 }
-
-                val equivalent = profile.equivalentFocalLength35Mm
-                val anchor = if (equivalent != null && baseEquivalent != null && baseEquivalent > 0f) {
-                    (equivalent / baseEquivalent).coerceIn(0.1f, 30f)
-                } else null
-
-                result += ValuableLens(
-                    id = LensStableId(stableId(profile)),
-                    cameraId = profile.routeCameraId,
-                    physicalCameraId = profile.physicalCameraId,
-                    facing = facing,
-                    inferredRole = inferRole(facing, equivalent),
-                    roleConfidence = roleConfidence(facing, equivalent),
-                    focalLengthMm = profile.primaryFocalLengthMm,
-                    sensorWidthMm = profile.sensorWidthMm,
-                    displayZoomAnchor = anchor,
-                    rawSupported = profile.supportsRaw,
-                )
             }
         }
 
@@ -92,10 +111,18 @@ object ValuableCameraResolver {
     private fun isPhotographicRoute(profile: CameraDeviceProfile): Boolean {
         if (profile.facing == LensFacing.UNKNOWN) return false
         if (profile.maxPhotoPixels <= 0L) return false
-        val onlyDepth = profile.capabilities.isNotEmpty() && profile.capabilities.all {
+
+        val onlyDepthOrTracking = profile.capabilities.isNotEmpty() && profile.capabilities.all {
             it == "DEPTH_OUTPUT" || it == "MOTION_TRACKING"
         }
-        return !onlyDepth
+        if (onlyDepthOrTracking) return false
+
+        // A route with neither optics nor a standard camera capability is normally an auxiliary
+        // service/ISP path rather than a lens users should select directly.
+        val hasOptics = profile.focalLengthsMm.any { it > 0f }
+        val standardCamera = "BACKWARD_COMPATIBLE" in profile.capabilities ||
+            profile.routeKind == CameraRouteKind.LOGICAL_PHYSICAL_MEMBER
+        return hasOptics || standardCamera
     }
 
     private fun chooseBaseEquivalent(
@@ -106,6 +133,92 @@ object ValuableCameraResolver {
         if (values.isEmpty()) return null
         val target = if (facing == LensFacing.FRONT) 26f else 25f
         return values.minByOrNull { abs(it - target) }
+    }
+
+    private val routePreferenceComparator = Comparator<CameraDeviceProfile> { left, right ->
+        val score = routePreferenceScore(right).compareTo(routePreferenceScore(left))
+        if (score != 0) return@Comparator score
+
+        val leftNumeric = left.routeCameraId.toLongOrNull()
+        val rightNumeric = right.routeCameraId.toLongOrNull()
+        when {
+            leftNumeric != null && rightNumeric != null -> leftNumeric.compareTo(rightNumeric)
+            leftNumeric != null -> -1
+            rightNumeric != null -> 1
+            else -> routeKey(left).compareTo(routeKey(right))
+        }
+    }
+
+    private fun routePreferenceScore(profile: CameraDeviceProfile): Int {
+        var score = 0
+        if (profile.routeKind == CameraRouteKind.ENUMERATED) score += 100
+        if ("BACKWARD_COMPATIBLE" in profile.capabilities) score += 50
+        if (profile.parentLogicalCameraId != null) score += 20
+        if (profile.supportsRaw) score += 16
+        if (profile.supportsManualSensor) score += 8
+        if (profile.supportsBurstCapture) score += 4
+        score += (profile.maxPhotoPixels / 1_000_000L).coerceAtMost(20L).toInt()
+        return score
+    }
+
+    /**
+     * Strong optical identity adapted from the previous Universal-Camera implementation.
+     *
+     * The exact Camera2 ID is deliberately excluded. Two routes with the same facing, sensor
+     * geometry, active array, focal lengths, equivalent focal lengths, apertures and output scale
+     * are overwhelmingly likely to be vendor aliases for the same physical lens.
+     */
+    private fun opticalFingerprint(profile: CameraDeviceProfile): String? {
+        if (profile.focalLengthsMm.isEmpty()) return null
+
+        val sensorWidth = profile.sensorWidthMm
+        val sensorHeight = profile.sensorHeightMm
+        val activeWidth = profile.activeArrayWidth
+        val activeHeight = profile.activeArrayHeight
+
+        // Require either physical sensor dimensions or an active-array geometry before collapsing
+        // routes. This intentionally errs on the side of keeping a genuine camera visible.
+        if ((sensorWidth == null || sensorHeight == null) &&
+            (activeWidth == null || activeHeight == null)
+        ) return null
+
+        val nativeFocals = profile.focalLengthsMm.sorted()
+            .joinToString(",") { quantize(it, 100f).toString() }
+        val equivalentFocals = profile.focalLengthsMm.sorted()
+            .mapNotNull { focal ->
+                sensorWidth?.takeIf { it > 0f }?.let { width -> focal * 36f / width }
+            }
+            .joinToString(",") { quantize(it, 10f).toString() }
+        val apertures = profile.apertures.sorted()
+            .joinToString(",") { quantize(it, 100f).toString() }
+
+        return buildString {
+            append(profile.facing.name)
+            append('|')
+            if (sensorWidth != null && sensorHeight != null) {
+                append(quantize(sensorWidth, 100f))
+                append('x')
+                append(quantize(sensorHeight, 100f))
+            } else {
+                append("sensor-na")
+            }
+            append('|')
+            if (activeWidth != null && activeHeight != null) {
+                append(activeWidth)
+                append('x')
+                append(activeHeight)
+            } else {
+                append("active-na")
+            }
+            append('|')
+            append(nativeFocals)
+            append('|')
+            append(equivalentFocals)
+            append('|')
+            append(apertures)
+            append('|')
+            append(profile.maxPhotoPixels)
+        }
     }
 
     private fun inferRole(facing: LensFacing, equivalentMm: Float?): LensRole {
@@ -165,4 +278,6 @@ object ValuableCameraResolver {
         LensFacing.EXTERNAL -> 2
         LensFacing.UNKNOWN -> 3
     }
+
+    private fun quantize(value: Float, scale: Float): Int = (value * scale).roundToInt()
 }
