@@ -25,11 +25,12 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Minimal production-style Camera2 preview owner for the live camera screen.
+ * Camera2 preview owner for the live camera screen.
  *
- * It deliberately owns exactly one CameraDevice/CameraCaptureSession at a time, routes a preview
- * surface to a physical member when the public logical-multi-camera API allows it, and converts
- * camera failures into UI state instead of letting them crash the process.
+ * It owns exactly one CameraDevice/CameraCaptureSession at a time, can route a preview Surface to a
+ * public physical member, and chooses the preview buffer from the user's composition aspect. The
+ * size policy is intentionally close to the previous Universal-Camera implementation: aspect
+ * accuracy first, then a ~1280 px long edge to keep preview latency/ISP load low on weak devices.
  */
 internal class Camera2PreviewController(
     context: Context,
@@ -48,23 +49,32 @@ internal class Camera2PreviewController(
     private var previewSurface: Surface? = null
     private var activeLensKey: String? = null
     private var pendingLens: ValuableLens? = null
+    private var pendingAspect: Float? = 4f / 3f
     private var opening = false
     private var released = false
 
-    fun bind(view: TextureView, lens: ValuableLens?) {
+    fun bind(
+        view: TextureView,
+        lens: ValuableLens?,
+        targetAspect: Float? = 4f / 3f,
+    ) {
         if (released) return
         textureView = view
         pendingLens = lens
+        pendingAspect = targetAspect
 
         if (view.surfaceTextureListener !== surfaceListener) {
             view.surfaceTextureListener = surfaceListener
         }
 
-        val key = lens?.let(::lensKey)
-        if (key == activeLensKey && (opening || cameraDevice != null || captureSession != null)) return
+        val key = lens?.let { lensKey(it, targetAspect) }
+        if (key == activeLensKey && (opening || cameraDevice != null || captureSession != null)) {
+            configureTransform(lens, view.width, view.height, targetAspect = targetAspect)
+            return
+        }
 
         if (view.isAvailable && lens != null) {
-            open(lens)
+            open(lens, targetAspect)
         } else if (lens == null) {
             closeCamera()
             emit(PreviewState.Idle)
@@ -82,11 +92,13 @@ internal class Camera2PreviewController(
 
     private val surfaceListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-            pendingLens?.let(::open)
+            pendingLens?.let { lens -> open(lens, pendingAspect) }
         }
 
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-            pendingLens?.let { lens -> configureTransform(lens, width, height) }
+            pendingLens?.let { lens ->
+                configureTransform(lens, width, height, targetAspect = pendingAspect)
+            }
         }
 
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
@@ -98,11 +110,11 @@ internal class Camera2PreviewController(
     }
 
     @SuppressLint("MissingPermission")
-    private fun open(lens: ValuableLens) {
+    private fun open(lens: ValuableLens, targetAspect: Float?) {
         if (released) return
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
-        val key = lensKey(lens)
+        val key = lensKey(lens, targetAspect)
 
         if (key == activeLensKey && (opening || cameraDevice != null)) return
 
@@ -113,9 +125,15 @@ internal class Camera2PreviewController(
 
         runCatching {
             val characteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
-            val size = choosePreviewSize(characteristics, view.width, view.height)
+            val size = choosePreviewSize(characteristics, targetAspect)
             texture.setDefaultBufferSize(size.width, size.height)
-            configureTransform(lens, view.width, view.height, size)
+            configureTransform(
+                lens = lens,
+                width = view.width,
+                height = view.height,
+                explicitSize = size,
+                targetAspect = targetAspect,
+            )
 
             cameraManager.openCamera(
                 lens.cameraId,
@@ -163,9 +181,7 @@ internal class Camera2PreviewController(
             val surface = Surface(texture)
             previewSurface = surface
             val output = OutputConfiguration(surface)
-            lens.physicalCameraId?.let { physicalId ->
-                output.setPhysicalCameraId(physicalId)
-            }
+            lens.physicalCameraId?.let { physicalId -> output.setPhysicalCameraId(physicalId) }
 
             val sessionConfig = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
@@ -251,33 +267,45 @@ internal class Camera2PreviewController(
         activeLensKey = null
     }
 
+    /**
+     * Prefer the exact requested composition ratio, then a long edge close to 1280 pixels. This is
+     * the same low-latency policy that behaved well in the previous camera app and avoids wasting
+     * memory/bandwidth on a huge preview Surface that does not improve captured quality.
+     */
     private fun choosePreviewSize(
         characteristics: CameraCharacteristics,
-        viewWidth: Int,
-        viewHeight: Int,
+        targetAspect: Float?,
     ): Size {
         val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val sizes = streamMap
             ?.getOutputSizes(SurfaceTexture::class.java)
             ?.filter { it.width > 0 && it.height > 0 }
+            ?.distinctBy { "${it.width}x${it.height}" }
             .orEmpty()
 
-        if (sizes.isEmpty()) return Size(1280, 720)
+        val requestedAspect = targetAspect
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?.let(::landscapeAspect)
+            ?: run {
+                val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                active?.let { landscapeAspect(it.width().toFloat() / it.height().toFloat()) }
+                    ?: 4f / 3f
+            }
 
-        val longView = max(viewWidth, viewHeight).coerceAtLeast(1)
-        val shortView = min(viewWidth, viewHeight).coerceAtLeast(1)
-        val targetRatio = longView.toFloat() / shortView.toFloat()
-        val maxPreviewArea = 2560L * 1440L
+        if (sizes.isEmpty()) {
+            return if (requestedAspect > 1.55f) Size(1280, 720) else Size(1280, 960)
+        }
 
-        val bounded = sizes.filter { it.width.toLong() * it.height <= maxPreviewArea }
-            .ifEmpty { sizes }
+        val bounded = sizes.filter {
+            max(it.width, it.height) <= 1440 && pixels(it) <= 1_800_000L
+        }.ifEmpty { sizes }
 
         return bounded.minWithOrNull(
             compareBy<Size> {
-                val longSide = max(it.width, it.height).toFloat()
-                val shortSide = min(it.width, it.height).coerceAtLeast(1).toFloat()
-                abs(longSide / shortSide - targetRatio)
-            }.thenByDescending { it.width.toLong() * it.height },
+                abs(sizeAspect(it) - requestedAspect)
+            }.thenBy {
+                abs(max(it.width, it.height) - 1280)
+            }.thenByDescending(::pixels),
         ) ?: sizes.first()
     }
 
@@ -286,13 +314,14 @@ internal class Camera2PreviewController(
         width: Int,
         height: Int,
         explicitSize: Size? = null,
+        targetAspect: Float? = pendingAspect,
     ) {
         if (width <= 0 || height <= 0) return
         val view = textureView ?: return
         val characteristics = runCatching {
             cameraManager.getCameraCharacteristics(lens.cameraId)
         }.getOrNull() ?: return
-        val size = explicitSize ?: choosePreviewSize(characteristics, width, height)
+        val size = explicitSize ?: choosePreviewSize(characteristics, targetAspect)
         val rotation = view.display?.rotation ?: Surface.ROTATION_0
         val matrix = Matrix()
         val viewRect = RectF(0f, 0f, width.toFloat(), height.toFloat())
@@ -317,6 +346,27 @@ internal class Camera2PreviewController(
             }
             Surface.ROTATION_180 -> matrix.postRotate(180f, centerX, centerY)
         }
+
+        // Square is not exposed as a PRIVATE stream on many HALs. When the closest stream has a
+        // different ratio, correct the default TextureView stretch and center-crop the excess.
+        if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180) {
+            val sourceAspect = sizeAspect(size)
+            val requested = targetAspect
+                ?.takeIf { it.isFinite() && it > 0f }
+                ?.let(::landscapeAspect)
+                ?: sourceAspect
+            when {
+                sourceAspect > requested + 0.01f ->
+                    matrix.postScale(1f, sourceAspect / requested, centerX, centerY)
+                requested > sourceAspect + 0.01f ->
+                    matrix.postScale(requested / sourceAspect, 1f, centerX, centerY)
+            }
+        }
+
+        val front = characteristics.get(CameraCharacteristics.LENS_FACING) ==
+            CameraCharacteristics.LENS_FACING_FRONT
+        if (front) matrix.postScale(-1f, 1f, centerX, centerY)
+
         view.setTransform(matrix)
     }
 
@@ -328,8 +378,18 @@ internal class Camera2PreviewController(
         }
     }
 
-    private fun lensKey(lens: ValuableLens): String =
-        "${lens.cameraId}:${lens.physicalCameraId ?: "direct"}"
+    private fun lensKey(lens: ValuableLens, targetAspect: Float?): String =
+        "${lens.cameraId}:${lens.physicalCameraId ?: "direct"}:a${aspectKey(targetAspect)}"
+
+    private fun aspectKey(value: Float?): Int =
+        value?.takeIf { it.isFinite() && it > 0f }?.let { (it * 1000f).toInt() } ?: 0
+
+    private fun landscapeAspect(value: Float): Float = if (value >= 1f) value else 1f / value
+
+    private fun sizeAspect(size: Size): Float =
+        max(size.width, size.height).toFloat() / min(size.width, size.height).coerceAtLeast(1).toFloat()
+
+    private fun pixels(size: Size): Long = size.width.toLong() * size.height.toLong()
 }
 
 internal sealed interface PreviewState {
