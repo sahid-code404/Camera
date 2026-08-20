@@ -63,6 +63,7 @@ jobs:
           test -n "$APK_REL"
           APK_ABS="$GITHUB_WORKSPACE/$APK_REL"
           OTA_NAME="Camera-dev-${GITHUB_RUN_NUMBER}.apk"
+          OTA_VERSION_CODE="$((100000 + GITHUB_RUN_NUMBER))"
           TMP_DIR="$(mktemp -d)"
 
           git config user.name "github-actions[bot]"
@@ -86,13 +87,13 @@ jobs:
 
           cat > update.json <<EOF
           {
-            "versionCode": ${GITHUB_RUN_NUMBER},
-            "versionName": "0.3.0-native.${GITHUB_RUN_NUMBER}-debug",
+            "versionCode": ${OTA_VERSION_CODE},
+            "versionName": "0.3.0-linear.${GITHUB_RUN_NUMBER}-debug",
             "apkUrl": "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ota/${OTA_NAME}",
             "sha256": "${SHA256}"
           }
           EOF
 
           git add -A
-          git commit -m "ota: publish native dev build ${GITHUB_RUN_NUMBER}"
+          git commit -m "ota: publish linear dev build ${GITHUB_RUN_NUMBER}"
           git push origin HEAD:ota
