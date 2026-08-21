@@ -100,7 +100,7 @@ class ValuableCameraResolverTest {
     }
 
     @Test
-    fun keepsRawLogicalRouteWhenChildrenCannotCaptureRaw() {
+    fun physicalChildCanInheritLogicalParentRawRoute() {
         val logicalRaw = profile(
             routeCameraId = "logical",
             facing = LensFacing.BACK,
@@ -110,7 +110,7 @@ class ValuableCameraResolverTest {
             logical = true,
             supportsRaw = true,
         )
-        val nonRawChild = profile(
+        val childWithoutStandaloneRawMetadata = profile(
             routeCameraId = "logical",
             physicalCameraId = "main",
             parent = "logical",
@@ -120,9 +120,15 @@ class ValuableCameraResolverTest {
             supportsRaw = false,
         )
 
-        val result = ValuableCameraResolver.resolve(listOf(logicalRaw, nonRawChild))
+        val result = ValuableCameraResolver.resolve(
+            listOf(logicalRaw, childWithoutStandaloneRawMetadata),
+        )
 
-        assertTrue(result.lenses.any { it.cameraId == "logical" && it.physicalCameraId == null && it.rawSupported })
+        assertEquals(1, result.lenses.size)
+        assertEquals("logical", result.lenses.single().cameraId)
+        assertEquals("main", result.lenses.single().physicalCameraId)
+        assertTrue(result.lenses.single().rawSupported)
+        assertTrue("logical:direct" in result.hiddenRouteKeys)
     }
 
     @Test
