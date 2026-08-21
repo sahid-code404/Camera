@@ -10,8 +10,9 @@ import kotlin.math.roundToInt
  * Thin JNI bridge. Kotlin owns orchestration only; full-frame image math and DNG serialization
  * live in C++.
  *
- * The output is one computational Linear DNG. Bayer-domain alignment/fusion happens first; all
- * color/tone/saturation/detail work happens only after native demosaic + Camera2 color calibration.
+ * Java Camera2 RAW and MotionCam-style NDK RAW both enter the exact same native processing call.
+ * The transport backend therefore cannot silently alter the computational algorithm or output
+ * format; it only supplies tightly packed Bayer samples and matching numeric sensor metadata.
  */
 object NativeComputationalRawEngine {
     init {
@@ -26,10 +27,96 @@ object NativeComputationalRawEngine {
         outputDirectory: File,
     ): FusedRaw {
         require(frames.isNotEmpty()) { "At least one RAW frame is required" }
+        val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+            ?: error("Selected RAW lens does not expose a Bayer CFA arrangement")
+        val core = processInputs(
+            frames = frames.map { frame ->
+                InputFrame(
+                    file = frame.file,
+                    width = frame.width,
+                    height = frame.height,
+                    exposureTimeNs = frame.exposureTimeNs,
+                    iso = frame.iso,
+                    blackLevels = frame.blackLevels,
+                    whiteLevel = frame.whiteLevel,
+                    awbGains = frame.awbGains,
+                    colorTransform = frame.sensorToLinearSrgb,
+                )
+            },
+            cfaArrangement = cfa,
+            settings = settings,
+            targetAspect = targetAspect,
+            outputDirectory = outputDirectory,
+        )
+        val referenceIndex = core.referenceIndex.coerceIn(frames.indices)
+        return FusedRaw(
+            width = core.width,
+            height = core.height,
+            file = core.file,
+            referenceResult = frames[referenceIndex].result,
+            referenceCharacteristics = characteristics,
+            frameCount = frames.size,
+            alignments = core.alignments,
+            acceptedSamples = core.acceptedSamples,
+            rejectedSamples = core.rejectedSamples,
+        )
+    }
+
+    /** Process RAW frames captured directly through ACameraManager/AImageReader. */
+    fun processNative(
+        frames: List<NativeRawFrame>,
+        cfaArrangement: Int,
+        settings: PhotoLensSettings,
+        targetAspect: Float,
+        outputDirectory: File,
+    ): NativeFusedRaw {
+        require(frames.isNotEmpty()) { "At least one NDK RAW frame is required" }
+        val core = processInputs(
+            frames = frames.map { frame ->
+                InputFrame(
+                    file = frame.file,
+                    width = frame.width,
+                    height = frame.height,
+                    exposureTimeNs = frame.exposureTimeNs,
+                    iso = frame.iso,
+                    blackLevels = frame.blackLevels,
+                    whiteLevel = frame.whiteLevel,
+                    awbGains = frame.awbGains,
+                    colorTransform = frame.sensorToLinearSrgb,
+                )
+            },
+            cfaArrangement = cfaArrangement,
+            settings = settings,
+            targetAspect = targetAspect,
+            outputDirectory = outputDirectory,
+        )
+        return NativeFusedRaw(
+            width = core.width,
+            height = core.height,
+            file = core.file,
+            frameCount = frames.size,
+            alignments = core.alignments,
+            acceptedSamples = core.acceptedSamples,
+            rejectedSamples = core.rejectedSamples,
+        )
+    }
+
+    private fun processInputs(
+        frames: List<InputFrame>,
+        cfaArrangement: Int,
+        settings: PhotoLensSettings,
+        targetAspect: Float,
+        outputDirectory: File,
+    ): CoreResult {
+        require(frames.isNotEmpty()) { "At least one RAW frame is required" }
         val width = frames.first().width
         val height = frames.first().height
-        require(frames.all { it.width == width && it.height == height }) {
+        require(width > 0 && height > 0 && frames.all { it.width == width && it.height == height }) {
             "RAW burst contains mismatched dimensions"
+        }
+        require(cfaArrangement in 0..3) { "Unsupported RAW CFA arrangement $cfaArrangement" }
+        require(frames.all { it.file.isFile && it.file.length() >= width.toLong() * height.toLong() * 2L }) {
+            "RAW burst contains an incomplete Bayer frame"
         }
 
         outputDirectory.mkdirs()
@@ -44,11 +131,11 @@ object NativeComputationalRawEngine {
                 awbGains[frameIndex * 4 + channel] = frame.awbGains.getOrElse(channel) { 1f }
             }
             for (element in 0 until 9) {
-                colorTransforms[frameIndex * 9 + element] = frame.sensorToLinearSrgb.getOrElse(element) {
+                colorTransforms[frameIndex * 9 + element] = frame.colorTransform.getOrElse(element) {
                     if (element % 4 == 0) 1f else 0f
                 }
             }
-            whiteLevels[frameIndex] = frame.whiteLevel
+            whiteLevels[frameIndex] = frame.whiteLevel.coerceAtLeast(1)
         }
 
         val hdrEnabled = settings.hdrEnabled ?: true
@@ -63,9 +150,6 @@ object NativeComputationalRawEngine {
             ?.roundToInt()
             ?.coerceIn(1, 4)
             ?: 1
-        val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
-            ?: error("Selected RAW lens does not expose a Bayer CFA arrangement")
-        require(cfa in 0..3) { "Unsupported RAW CFA arrangement $cfa" }
         val aspect = targetAspect.takeIf { it.isFinite() && it > 0f } ?: 4f / 3f
         val cameraModel = buildString {
             append(Build.MANUFACTURER.ifBlank { "Android" })
@@ -75,15 +159,15 @@ object NativeComputationalRawEngine {
 
         val metrics = nativeProcess(
             inputPaths = frames.map { it.file.absolutePath }.toTypedArray(),
-            exposureTimesNs = LongArray(frames.size) { frames[it].exposureTimeNs },
-            sensitivities = IntArray(frames.size) { frames[it].iso },
+            exposureTimesNs = LongArray(frames.size) { frames[it].exposureTimeNs.coerceAtLeast(1L) },
+            sensitivities = IntArray(frames.size) { frames[it].iso.coerceAtLeast(1) },
             blackLevels = blackLevels,
             whiteLevels = whiteLevels,
             awbGains = awbGains,
             colorTransforms = colorTransforms,
             width = width,
             height = height,
-            cfaArrangement = cfa,
+            cfaArrangement = cfaArrangement,
             hdrEnabled = hdrEnabled,
             hdrStrength = hdrStrength,
             highlightProtection = highlight,
@@ -116,16 +200,16 @@ object NativeComputationalRawEngine {
                 )
                 offset += 3
             }
-            while (size < frames.size) add(RawAlignment(0, 0, if (size == referenceIndex) 1f else 0f))
+            while (size < frames.size) {
+                add(RawAlignment(0, 0, if (size == referenceIndex) 1f else 0f))
+            }
         }
 
-        return FusedRaw(
+        return CoreResult(
             width = metrics[0].toInt(),
             height = metrics[1].toInt(),
             file = output,
-            referenceResult = frames[referenceIndex].result,
-            referenceCharacteristics = characteristics,
-            frameCount = frames.size,
+            referenceIndex = referenceIndex,
             alignments = alignments,
             acceptedSamples = metrics[2],
             rejectedSamples = metrics[3],
@@ -155,6 +239,28 @@ object NativeComputationalRawEngine {
         cameraModel: String,
         outputPath: String,
     ): LongArray
+
+    private data class InputFrame(
+        val file: File,
+        val width: Int,
+        val height: Int,
+        val exposureTimeNs: Long,
+        val iso: Int,
+        val blackLevels: IntArray,
+        val whiteLevel: Int,
+        val awbGains: FloatArray,
+        val colorTransform: FloatArray,
+    )
+
+    private data class CoreResult(
+        val width: Int,
+        val height: Int,
+        val file: File,
+        val referenceIndex: Int,
+        val alignments: List<RawAlignment>,
+        val acceptedSamples: Long,
+        val rejectedSamples: Long,
+    )
 
     private const val HEADER_SIZE = 5
 }
