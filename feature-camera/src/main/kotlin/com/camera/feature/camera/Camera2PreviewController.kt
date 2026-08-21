@@ -2,6 +2,7 @@ package com.camera.feature.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.RectF
@@ -11,10 +12,12 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RecommendedStreamConfigurationMap
 import android.hardware.camera2.params.SessionConfiguration
 import android.os.Build
 import android.os.Handler
@@ -29,6 +32,7 @@ import android.view.TextureView
 import android.view.ViewTreeObserver
 import com.camera.camera.camera2.CameraRouteValidationCache
 import com.camera.camera.camera2.NativeCameraNdkBridge
+import com.camera.core.model.LensFacing
 import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
 import com.camera.processing.raw.FusedDngWriter
@@ -57,7 +61,6 @@ internal class Camera2PreviewController(
 ) {
     private val appContext = context.applicationContext
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
-    private val javaCameraIds = runCatching { cameraManager.cameraIdList.toSet() }.getOrDefault(emptySet())
     private val thread = HandlerThread("Camera2Preview").apply { start() }
     private val handler = Handler(thread.looper)
     private val processingThread = HandlerThread("CameraRawProcessing").apply { start() }
@@ -84,6 +87,7 @@ internal class Camera2PreviewController(
     private var activeCharacteristics: CameraCharacteristics? = null
     private var activePreviewSize: Size? = null
     private var activeLensKey: String? = null
+    private var activeCameraId: String? = null
     private var activeNativeDescriptor: NativeCameraNdkBridge.Descriptor? = null
     private var nativeSessionActive = false
     private var pendingLens: ValuableLens? = null
@@ -131,15 +135,9 @@ internal class Camera2PreviewController(
     }
 
     private val windowFocusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
-        handler.post {
-            if (released) return@post
-            if (hasFocus) {
-                reopenIfPossible()
-            } else {
-                closeCamera()
-                emit(PreviewState.Idle)
-            }
-        }
+        // Dialogs, menus, permission sheets and Compose overlays may steal window focus. They must
+        // never tear down a healthy camera stream; only a real Surface/lifecycle teardown may do it.
+        if (hasFocus) handler.post { if (!released) reopenIfPossible() }
     }
 
     private val availabilityCallback = object : CameraManager.AvailabilityCallback() {
@@ -156,7 +154,7 @@ internal class Camera2PreviewController(
                 lens.cameraId == cameraId &&
                 cameraDevice == null &&
                 !opening &&
-                textureView?.hasWindowFocus() == true
+                textureView?.isAttachedToWindow == true
             ) {
                 emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
             }
@@ -193,7 +191,7 @@ internal class Camera2PreviewController(
             }
             return
         }
-        if (view.isAvailable && lens != null && view.hasWindowFocus()) {
+        if (view.isAvailable && lens != null && view.isAttachedToWindow) {
             open(lens, targetAspect)
         } else if (lens == null) {
             closeCamera()
@@ -209,7 +207,7 @@ internal class Camera2PreviewController(
             if (released || captureInFlight) return@post
             val lens = pendingLens ?: return@post
             val view = textureView ?: return@post
-            if (!view.isAvailable || !view.hasWindowFocus()) return@post
+            if (!view.isAvailable || !view.isAttachedToWindow) return@post
 
             val nativeDescriptor = activeNativeDescriptor
             if (
@@ -234,6 +232,10 @@ internal class Camera2PreviewController(
                 return@post
             }
 
+            val dngOrientation = computeDngOrientation(
+                sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+                facing = lens.facing,
+            )
             pendingAspect = targetAspect
             captureInFlight = true
             emitCapture(PhotoCaptureState.Capturing)
@@ -244,6 +246,7 @@ internal class Camera2PreviewController(
                 characteristics = characteristics,
                 settings = settings,
                 targetAspect = targetAspect ?: 4f / 3f,
+                dngOrientation = dngOrientation,
             )
         }
     }
@@ -269,6 +272,7 @@ internal class Camera2PreviewController(
         characteristics: CameraCharacteristics,
         settings: PhotoLensSettings,
         targetAspect: Float,
+        dngOrientation: Int,
     ) {
         computationalRaw.capture(
             camera = camera,
@@ -277,6 +281,7 @@ internal class Camera2PreviewController(
             latestPreviewResult = latestPreviewResult,
             settings = settings,
             targetAspect = targetAspect,
+            dngOrientation = dngOrientation,
             onAcquisitionFinished = {
                 handler.post { if (!released) restorePreviewIfPossible() }
             },
@@ -308,6 +313,10 @@ internal class Camera2PreviewController(
         settings: PhotoLensSettings,
         targetAspect: Float,
     ) {
+        val dngOrientation = computeDngOrientation(
+            sensorOrientation = descriptor.sensorOrientation ?: 0,
+            facing = lens.facing,
+        )
         captureInFlight = true
         emitCapture(PhotoCaptureState.Capturing)
         val captureKey = activeLensKey
@@ -362,6 +371,7 @@ internal class Camera2PreviewController(
                         context = appContext,
                         fused = fused,
                         description = description,
+                        orientation = dngOrientation,
                     )
                     CameraRouteValidationCache.markRawVerified(appContext, lens)
                     handler.post {
@@ -468,7 +478,7 @@ internal class Camera2PreviewController(
         if (released || opening || cameraDevice != null || nativeSessionActive) return
         val view = textureView ?: return
         val lens = pendingLens ?: return
-        if (!view.isAvailable || !view.isAttachedToWindow || !view.hasWindowFocus()) return
+        if (!view.isAvailable || !view.isAttachedToWindow) return
         open(lens, pendingAspect)
     }
 
@@ -477,7 +487,7 @@ internal class Camera2PreviewController(
         if (released) return
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
-        if (!view.isAttachedToWindow || !view.hasWindowFocus()) return
+        if (!view.isAttachedToWindow) return
         val key = lensKey(lens, targetAspect)
         if (key == activeLensKey && (opening || cameraDevice != null || nativeSessionActive)) return
 
@@ -487,7 +497,31 @@ internal class Camera2PreviewController(
             return
         }
 
-        closeCamera()
+        // Logical/physical lens switches under the same CameraDevice do not need a device reopen.
+        // Creating a new session directly lets Camera2 retire the old session and reuse the Surface.
+        val reusableCamera = cameraDevice?.takeIf { activeCameraId == lens.cameraId }
+        if (reusableCamera != null) {
+            activeLensKey = key
+            opening = true
+            runCatching {
+                val characteristics = cameraManager.getCameraCharacteristics(lens.cameraId)
+                activeCharacteristics = characteristics
+                configureZoomRange(characteristics)
+                val size = choosePreviewSize(characteristics, targetAspect)
+                activePreviewSize = size
+                texture.setDefaultBufferSize(size.width, size.height)
+                configureTransform(lens, view.width, view.height, size, targetAspect)
+                createPreviewSession(reusableCamera, lens, texture, size)
+            }.onFailure { error ->
+                opening = false
+                closeCamera(preserveSurface = true)
+                emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
+            }
+            return
+        }
+
+        closeCamera(preserveSurface = true)
+        activeCameraId = lens.cameraId
         activeLensKey = key
         opening = true
         emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
@@ -504,7 +538,7 @@ internal class Camera2PreviewController(
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         opening = false
-                        if (released || activeLensKey != key || textureView?.hasWindowFocus() != true) {
+                        if (released || activeLensKey != key || textureView?.isAttachedToWindow != true) {
                             camera.close()
                             return
                         }
@@ -541,7 +575,7 @@ internal class Camera2PreviewController(
         texture: SurfaceTexture,
         key: String,
     ) {
-        closeCamera()
+        closeCamera(preserveSurface = true)
         activeLensKey = key
         activeNativeDescriptor = descriptor
         opening = true
@@ -568,7 +602,7 @@ internal class Camera2PreviewController(
             emit(PreviewState.Error(error))
             return
         }
-        if (released || activeLensKey != key || textureView?.hasWindowFocus() != true) {
+        if (released || activeLensKey != key || textureView?.isAttachedToWindow != true) {
             NativeCameraNdkBridge.stopSession()
             nativeSessionActive = false
             return
@@ -589,8 +623,7 @@ internal class Camera2PreviewController(
     }
 
     private fun nativeDescriptorFor(lens: ValuableLens): NativeCameraNdkBridge.Descriptor? {
-        if (lens.physicalCameraId != null) return null
-        if (!lens.nativeRoutePreferred && lens.cameraId in javaCameraIds) return null
+        if (lens.physicalCameraId != null || !lens.nativeRoutePreferred) return null
         return NativeCameraNdkBridge.descriptor(lens.cameraId)
     }
 
@@ -603,7 +636,7 @@ internal class Camera2PreviewController(
     }
 
     private fun markWaitingForCamera(lens: ValuableLens) {
-        if (!released && pendingLens?.id == lens.id && textureView?.hasWindowFocus() == true) {
+        if (!released && pendingLens?.id == lens.id && textureView?.isAttachedToWindow == true) {
             emit(PreviewState.Opening(lens.cameraId, lens.physicalCameraId))
         } else emit(PreviewState.Idle)
     }
@@ -643,6 +676,14 @@ internal class Camera2PreviewController(
                 ?: Surface(texture).also { previewSurface = it }
             val output = OutputConfiguration(surface)
             lens.physicalCameraId?.let(output::setPhysicalCameraId)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val useCases = activeCharacteristics
+                    ?.get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES)
+                    .orEmpty()
+                if (useCases.contains(CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong())) {
+                    output.streamUseCase = CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong()
+                }
+            }
             camera.createCaptureSession(
                 SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
@@ -650,14 +691,16 @@ internal class Camera2PreviewController(
                     executor,
                     object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(session: CameraCaptureSession) {
-                            if (cameraDevice !== camera || released || textureView?.hasWindowFocus() != true) {
+                            if (cameraDevice !== camera || released || textureView?.isAttachedToWindow != true) {
                                 session.close()
                                 return
                             }
+                            opening = false
                             captureSession = session
                             startRepeating(camera, session, surface, lens, previewSize)
                         }
                         override fun onConfigureFailed(session: CameraCaptureSession) {
+                            opening = false
                             session.close()
                             if (captureSession === session) captureSession = null
                             CameraRouteValidationCache.markRejected(appContext, lens)
@@ -676,7 +719,7 @@ internal class Camera2PreviewController(
             )
         }.onFailure { error ->
             if (isRecoverableOpenFailure(error)) {
-                closeCamera()
+                closeCamera(preserveSurface = true)
                 markWaitingForCamera(lens)
             } else emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
         }
@@ -711,7 +754,7 @@ internal class Camera2PreviewController(
             )
         }.onFailure { error ->
             if (isRecoverableOpenFailure(error)) {
-                closeCamera()
+                closeCamera(preserveSurface = true)
                 markWaitingForCamera(lens)
             } else emit(PreviewState.Error(error.message ?: error.javaClass.simpleName))
         }
@@ -869,7 +912,7 @@ internal class Camera2PreviewController(
         val view = textureView ?: return
         val texture = view.surfaceTexture ?: return
         val size = activePreviewSize ?: return
-        if (!view.isAvailable || !view.hasWindowFocus() || captureSession != null) return
+        if (!view.isAvailable || !view.isAttachedToWindow || captureSession != null) return
         createPreviewSession(camera, lens, texture, size)
     }
 
@@ -894,7 +937,7 @@ internal class Camera2PreviewController(
         if (definitive) CameraRouteValidationCache.markRejected(appContext, lens)
     }
 
-    private fun closeCamera() {
+    private fun closeCamera(preserveSurface: Boolean = false) {
         opening = false
         captureInFlight = false
         handler.removeCallbacks(clearFocusRunnable)
@@ -904,29 +947,45 @@ internal class Camera2PreviewController(
         }
         nativeSessionActive = false
         activeNativeDescriptor = null
-        runCatching { captureSession?.stopRepeating() }
-        runCatching { captureSession?.abortCaptures() }
-        runCatching { captureSession?.close() }
-        runCatching { cameraDevice?.close() }
-        runCatching { previewSurface?.release() }
+
+        // CameraDevice.close() is the fastest device-switch path; it discards outstanding work and
+        // tears down its active session. Do not serially stop/abort/close the session first.
+        val device = cameraDevice
+        if (device != null) {
+            runCatching { device.close() }
+        } else {
+            runCatching { captureSession?.close() }
+        }
+        if (!preserveSurface) runCatching { previewSurface?.release() }
         captureSession = null
         cameraDevice = null
-        previewSurface = null
+        if (!preserveSurface) previewSurface = null
         previewBuilder = null
         activeCharacteristics = null
         activePreviewSize = null
         activeLensKey = null
+        activeCameraId = null
         lastMeteringRegion = null
         latestPreviewResult = null
         emitFocus(null)
     }
 
     private fun choosePreviewSize(characteristics: CameraCharacteristics, targetAspect: Float?): Size {
-        val sizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val exhaustive = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(SurfaceTexture::class.java)
-            ?.filter { it.width > 0 && it.height > 0 }
-            ?.distinctBy { "${it.width}x${it.height}" }
+            ?.toList()
             .orEmpty()
+        val recommended = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                characteristics
+                    .getRecommendedStreamConfigurationMap(RecommendedStreamConfigurationMap.USECASE_PREVIEW)
+                    ?.getOutputSizes(ImageFormat.PRIVATE)
+                    ?.toList()
+            }.getOrNull().orEmpty()
+        } else emptyList()
+        val sizes = (recommended.ifEmpty { exhaustive })
+            .filter { it.width > 0 && it.height > 0 }
+            .distinctBy { "${it.width}x${it.height}" }
         val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val sensorAspect = active?.let {
             landscapeAspect(it.width().toFloat() / it.height().toFloat())
@@ -937,19 +996,16 @@ internal class Camera2PreviewController(
             ?: sensorAspect
         val squareComposition = abs(compositionAspect - 1f) < 0.03f
         val streamAspect = if (squareComposition) sensorAspect else compositionAspect
-        val targetLongEdge = if (squareComposition) 1440 else 1280
+        val viewLongEdge = textureView?.let { max(it.width, it.height) }?.coerceAtLeast(0) ?: 0
+        val targetLongEdge = max(1600, (viewLongEdge * 1.20f).toInt()).coerceAtMost(1920)
         if (sizes.isEmpty()) return when {
-            streamAspect > 1.55f -> Size(1280, 720)
-            squareComposition -> Size(1440, 1080)
-            else -> Size(1280, 960)
+            streamAspect > 1.55f -> Size(1920, 1080)
+            else -> Size(1920, 1440)
         }
         val bounded = sizes
-            .filter { max(it.width, it.height) <= 1920 && pixels(it) <= 2_100_000L }
+            .filter { max(it.width, it.height) <= 2560 && pixels(it) <= 3_700_000L }
             .ifEmpty { sizes }
-        val candidates = if (squareComposition) {
-            bounded.filter { pixels(it) >= 900_000L }.ifEmpty { bounded }
-        } else bounded
-        return candidates.minWithOrNull(
+        return bounded.minWithOrNull(
             compareBy<Size> { abs(sizeAspect(it) - streamAspect) }
                 .thenBy { abs(max(it.width, it.height) - targetLongEdge) }
                 .thenByDescending(::pixels),
@@ -1016,6 +1072,18 @@ internal class Camera2PreviewController(
             }
         }
         view.setTransform(matrix)
+    }
+
+    private fun computeDngOrientation(sensorOrientation: Int, facing: LensFacing): Int {
+        val deviceDegrees = rotationDegrees(textureView?.display?.rotation ?: Surface.ROTATION_0)
+        val sign = if (facing == LensFacing.FRONT) 1 else -1
+        val degrees = ((sensorOrientation - deviceDegrees * sign) % 360 + 360) % 360
+        return when (degrees) {
+            90 -> 6   // TIFF/Exif rotate 90 CW
+            180 -> 3  // rotate 180
+            270 -> 8  // rotate 270 CW
+            else -> 1 // normal
+        }
     }
 
     private fun rotationDegrees(rotation: Int): Int = when (rotation) {

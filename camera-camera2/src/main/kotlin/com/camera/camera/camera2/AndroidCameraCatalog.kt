@@ -16,6 +16,9 @@ import com.camera.core.model.CameraStreamCapabilities
 import com.camera.core.model.FloatValueRange
 import com.camera.core.model.IntValueRange
 import com.camera.core.model.LensFacing
+import com.camera.core.model.LensRole
+import com.camera.core.model.LensStableId
+import com.camera.core.model.ValuableLens
 import com.camera.core.model.LongValueRange
 import com.camera.core.model.PixelSize
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +59,8 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
         var firstCompatible: Pair<String, CameraCharacteristics>? = null
         var firstBack: Pair<String, CameraCharacteristics>? = null
 
+        // Absolute minimum Camera2 work for first frame: one characteristics block at a time and
+        // stop at the first normal rear route. Do NOT enumerate stream-size tables here.
         for (id in javaIds) {
             val chars = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: continue
             val capabilities = chars
@@ -73,28 +78,34 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
         }
 
         val selected = firstBack ?: firstCompatible
-        val profiles = selected?.let { (id, chars) ->
+        val lenses = selected?.let { (id, chars) ->
+            val facing = facingOf(chars.get(CameraCharacteristics.LENS_FACING))
+            val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                ?.firstOrNull { it > 0f }
+            val sensorWidth = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.width
             listOf(
-                buildJavaProfile(
-                    routeCameraId = id,
-                    physicalCameraId = null,
-                    parentLogicalCameraId = null,
-                    routeKind = CameraRouteKind.ENUMERATED,
-                    characteristics = chars,
-                    inheritedFacing = null,
+                ValuableLens(
+                    id = LensStableId("startup:$id"),
+                    cameraId = id,
+                    facing = facing,
+                    inferredRole = if (facing == LensFacing.FRONT) LensRole.FRONT_WIDE else LensRole.WIDE,
+                    roleConfidence = 0.5f,
+                    focalLengthMm = focal,
+                    sensorWidthMm = sensorWidth,
+                    displayZoomAnchor = 1f,
+                    rawSupported = false,
+                    nativeRoutePreferred = false,
                 ),
             )
         }.orEmpty()
-        val resolution = ValuableCameraResolver.resolve(profiles)
         CameraCatalogSnapshot(
-            deviceProfiles = profiles,
-            valuableLenses = resolution.lenses,
-            diagnosticsJson = diagnosticsJson(
-                profiles = profiles,
-                hidden = resolution.hiddenRouteKeys,
-                javaIds = javaIds,
-                ndkIds = emptyList(),
-            ),
+            deviceProfiles = emptyList(),
+            valuableLenses = lenses,
+            diagnosticsJson = JSONObject()
+                .put("schemaVersion", 2)
+                .put("startupSeed", true)
+                .put("javaCameraIds", JSONArray(javaIds))
+                .toString(),
         )
     }
 

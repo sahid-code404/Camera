@@ -111,7 +111,7 @@ SizePair choosePreview(const ACameraMetadata* metadata, const SizePair& raw) {
     long long bestArea = 0;
     for (const auto& size : previews) {
         const long long area = size.area();
-        if (area > 1920LL * 1080LL) continue;
+        if (area > 2560LL * 1440LL) continue;
         const double ratio = static_cast<double>(size.width) / size.height;
         if (std::abs(ratio - rawRatio) > 0.08) continue;
         if (area > bestArea) {
@@ -121,13 +121,13 @@ SizePair choosePreview(const ACameraMetadata* metadata, const SizePair& raw) {
     }
     if (bestArea == 0) {
         for (const auto& size : previews) {
-            if (size.area() <= 1920LL * 1080LL && size.area() > bestArea) {
+            if (size.area() <= 2560LL * 1440LL && size.area() > bestArea) {
                 best = size;
                 bestArea = size.area();
             }
         }
     }
-    return bestArea > 0 ? best : previews.back();
+    return bestArea > 0 ? best : previews.front();
 }
 
 void appendIntArray(std::ostringstream& out, const int* values, int count) {
@@ -157,6 +157,7 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
     if (preview.width <= 0 || preview.height <= 0) return {};
 
     int facing = -1;
+    int sensorOrientation = 0;
     int hardware = -1;
     float focal = 0.0f;
     float sensorWidth = 0.0f;
@@ -174,6 +175,7 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
 
     ACameraMetadata_const_entry entry{};
     if (getEntry(metadata.get(), ACAMERA_LENS_FACING, &entry) && entry.count > 0) facing = entry.data.u8[0];
+    if (getEntry(metadata.get(), ACAMERA_SENSOR_ORIENTATION, &entry) && entry.count > 0) sensorOrientation = entry.data.i32[0];
     if (getEntry(metadata.get(), ACAMERA_INFO_SUPPORTED_HARDWARE_LEVEL, &entry) && entry.count > 0) hardware = entry.data.u8[0];
     if (getEntry(metadata.get(), ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &entry) && entry.count > 0) focal = entry.data.f[0];
     if (getEntry(metadata.get(), ACAMERA_SENSOR_INFO_PHYSICAL_SIZE, &entry) && entry.count >= 2) {
@@ -205,6 +207,7 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
     out << '{'
         << "\"id\":\"" << jsonEscape(cameraId) << "\","
         << "\"facing\":" << facing << ','
+        << "\"sensorOrientation\":" << sensorOrientation << ','
         << "\"hardware\":\"" << hardwareLevelName(static_cast<uint8_t>(hardware)) << "\","
         << "\"rawCapabilityAdvertised\":" << (rawCapabilityAdvertised ? "true" : "false") << ','
         << "\"rawFormat\":" << raw.format << ','

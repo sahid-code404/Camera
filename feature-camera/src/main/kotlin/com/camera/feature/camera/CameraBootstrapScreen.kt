@@ -105,7 +105,7 @@ fun CameraBootstrapScreen() {
                 PackageManager.PERMISSION_GRANTED,
         )
     }
-    // 0=rear preview seed, 1=advertised routes complete, 2=deep hidden-AUX complete.
+    // 0=rear preview seed only, 2=complete advertised + physical + hidden AUX discovery.
     var discoveryStage by remember { mutableStateOf(0) }
 
     val controller = remember(context) {
@@ -135,7 +135,7 @@ fun CameraBootstrapScreen() {
         discoveryError = null
         discoveryStage = 0
 
-        // Critical path: return as soon as the first normal rear camera is known.
+        // Give openCamera() the camera service exclusively until the first viewfinder is alive.
         val primaryResult = runCatching { catalog.scanPrimaryRearValidated(context) }
         val primary = primaryResult.getOrNull()
         if (primary != null && primary.valuableLenses.isNotEmpty()) {
@@ -143,35 +143,23 @@ fun CameraBootstrapScreen() {
             return@LaunchedEffect
         }
 
-        val advertisedResult = runCatching { catalog.scanValidated(context, deepScan = false) }
-        advertisedResult.onSuccess { advertised -> snapshot = advertised }
-        discoveryStage = 1
+        // Unusual device with no normal rear seed: pay for the complete scan immediately.
+        val deepResult = runCatching { catalog.scanValidated(context, deepScan = true) }
+        deepResult.onSuccess { deep -> snapshot = deep }
+        discoveryStage = 2
         if (snapshot == null) {
-            val failure = advertisedResult.exceptionOrNull() ?: primaryResult.exceptionOrNull()
+            val failure = deepResult.exceptionOrNull() ?: primaryResult.exceptionOrNull()
             discoveryError = failure?.message ?: failure?.javaClass?.simpleName ?: "Camera discovery failed"
         }
     }
 
-    LaunchedEffect(cameraPermissionGranted, snapshot, discoveryStage) {
-        if (!cameraPermissionGranted || snapshot == null || discoveryStage != 0) return@LaunchedEffect
-
-        // One UI turn gives TextureView/openCamera first dispatch; metadata then runs in parallel.
-        kotlinx.coroutines.yield()
-        val advertisedResult = runCatching { catalog.scanValidated(context, deepScan = false) }
-        advertisedResult.onSuccess { advertised -> snapshot = advertised }
-        discoveryStage = 1
-    }
-
     LaunchedEffect(cameraPermissionGranted, previewState, discoveryStage, snapshot) {
-        if (!cameraPermissionGranted || discoveryStage != 1) return@LaunchedEffect
-        val hasRawRoute = snapshot?.valuableLenses?.any { it.rawSupported } == true
-        when {
-            previewState is PreviewState.Streaming -> kotlinx.coroutines.delay(80L)
-            previewState is PreviewState.Error -> Unit
-            !hasRawRoute -> Unit
-            else -> return@LaunchedEffect
-        }
+        if (!cameraPermissionGranted || snapshot == null || discoveryStage != 0) return@LaunchedEffect
+        if (previewState !is PreviewState.Streaming && previewState !is PreviewState.Error) return@LaunchedEffect
 
+        // Single complete pass. This replaces the old advertised-then-deep duplicate scan and only
+        // starts after first-frame delivery, so AUX discovery cannot steal camera-service time from
+        // opening the main viewfinder.
         val deepResult = runCatching { catalog.scanValidated(context, deepScan = true) }
         deepResult.onSuccess { deep -> snapshot = deep }
         discoveryStage = 2
@@ -181,9 +169,10 @@ fun CameraBootstrapScreen() {
         }
     }
 
-    LaunchedEffect(snapshot?.valuableLenses) {
+    LaunchedEffect(snapshot?.valuableLenses, discoveryStage) {
         val lenses = snapshot?.valuableLenses.orEmpty()
-        if (lenses.isNotEmpty()) lensStore.reconcile(lenses)
+        // Never persist the temporary first-frame seed lens.
+        if (discoveryStage >= 2 && lenses.isNotEmpty()) lensStore.reconcile(lenses)
     }
 
     val allVisibleLenses = snapshot?.valuableLenses
@@ -261,9 +250,7 @@ fun CameraBootstrapScreen() {
                     Modifier
                         .fillMaxSize()
                         .background(
-                            Color.Black.copy(
-                                alpha = if (previewState is PreviewState.Streaming) 0.03f else 0.24f,
-                            ),
+                            Color.Transparent,
                         ),
                 )
 
@@ -545,9 +532,6 @@ private fun CameraStatus(
         }
         captureState is PhotoCaptureState.Saving -> {
             Text("Native DNG processing…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
-        }
-        previewState is PreviewState.Opening -> {
-            Text("Opening camera…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
         }
         else -> Unit
     }

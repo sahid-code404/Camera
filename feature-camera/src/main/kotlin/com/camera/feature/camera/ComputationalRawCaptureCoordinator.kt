@@ -70,6 +70,7 @@ internal class ComputationalRawCaptureCoordinator(
         latestPreviewResult: TotalCaptureResult?,
         settings: PhotoLensSettings,
         targetAspect: Float,
+        dngOrientation: Int,
         onAcquisitionFinished: () -> Unit,
         onProcessing: (Int) -> Unit,
         onSaved: (String) -> Unit,
@@ -113,6 +114,7 @@ internal class ComputationalRawCaptureCoordinator(
             characteristics = sensorCharacteristics,
             settings = settings,
             targetAspect = targetAspect.takeIf { it.isFinite() && it > 0f } ?: 4f / 3f,
+            dngOrientation = dngOrientation,
             expectedFrames = expectedFrames,
             reader = reader,
             onAcquisitionFinished = onAcquisitionFinished,
@@ -439,6 +441,7 @@ internal class ComputationalRawCaptureCoordinator(
                         context = appContext,
                         fused = fused,
                         description = description,
+                        orientation = state.dngOrientation,
                     )
                     if (isActive(state)) {
                         active = null
@@ -548,6 +551,7 @@ internal class ComputationalRawCaptureCoordinator(
         val characteristics: CameraCharacteristics,
         val settings: PhotoLensSettings,
         val targetAspect: Float,
+        val dngOrientation: Int,
         val expectedFrames: Int,
         val reader: ImageReader,
         val onAcquisitionFinished: () -> Unit,
