@@ -8,16 +8,17 @@ import org.json.JSONObject
 /**
  * MotionCam-style camera backend using the public Android NDK camera APIs.
  *
- * Discovery deliberately uses ACameraManager rather than Java CameraManager so Qualcomm/Xiaomi
- * auxiliary IDs that are native-service-visible can participate without hard-coded ID lists or
- * package-name spoofing. NDK-only lenses also use the same native API to open preview and acquire
- * genuine RAW10/RAW16 frames; they are never routed back through a processed JPEG/YUV path.
+ * Discovery deliberately uses ACameraManager rather than Java CameraManager so auxiliary IDs that
+ * are native-service-visible can participate without hard-coded ID lists or package-name spoofing.
+ * NDK-only lenses use the same native API for preview and genuine RAW10/RAW12/RAW16 acquisition;
+ * processed JPEG/YUV data is never relabeled as RAW.
  */
 object NativeCameraNdkBridge {
     data class Descriptor(
         val id: String,
         val facing: Int,
         val hardware: String,
+        val rawCapabilityAdvertised: Boolean,
         val rawFormat: Int,
         val rawWidth: Int,
         val rawHeight: Int,
@@ -56,6 +57,10 @@ object NativeCameraNdkBridge {
         val cfaArrangement: Int,
         val rawFormat: Int,
         val frames: List<CapturedRawFrame>,
+        /** Native session policy actually used for this burst: concurrent or switch. */
+        val captureStrategy: String,
+        /** False means the RAW succeeded but the native preview session needs to be reopened. */
+        val previewRestored: Boolean,
     )
 
     private val loaded = runCatching {
@@ -80,16 +85,22 @@ object NativeCameraNdkBridge {
                     val item = array.optJSONObject(index) ?: continue
                     val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
                     val black = item.optJSONArray("black")
+                    val rawWidth = item.optInt("rawWidth", 0)
+                    val rawHeight = item.optInt("rawHeight", 0)
+                    val previewWidth = item.optInt("previewWidth", 0)
+                    val previewHeight = item.optInt("previewHeight", 0)
+                    if (rawWidth <= 0 || rawHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) continue
                     add(
                         Descriptor(
                             id = id,
                             facing = item.optInt("facing", -1),
                             hardware = item.optString("hardware", "UNKNOWN"),
+                            rawCapabilityAdvertised = item.optBoolean("rawCapabilityAdvertised", false),
                             rawFormat = item.optInt("rawFormat", 0),
-                            rawWidth = item.optInt("rawWidth", 0),
-                            rawHeight = item.optInt("rawHeight", 0),
-                            previewWidth = item.optInt("previewWidth", 0),
-                            previewHeight = item.optInt("previewHeight", 0),
+                            rawWidth = rawWidth,
+                            rawHeight = rawHeight,
+                            previewWidth = previewWidth,
+                            previewHeight = previewHeight,
                             focalLengthMm = item.optPositiveFloat("focal"),
                             sensorWidthMm = item.optPositiveFloat("sensorWidth"),
                             sensorHeightMm = item.optPositiveFloat("sensorHeight"),
@@ -134,19 +145,22 @@ object NativeCameraNdkBridge {
     }
 
     /**
-     * Synchronously acquires a true native RAW burst. Call from a worker thread, not the main UI
-     * thread. RAW10 is unpacked natively into tightly packed 16-bit Bayer samples before returning.
+     * Synchronously acquires a genuine RAW burst. Call from a worker thread.
+     *
+     * Pass frameCount=0 for native light-adaptive sampling (4..8 frames). Packed RAW10/RAW12 is
+     * unpacked natively into tightly packed 16-bit Bayer samples before the computational engine.
      */
     fun captureBurst(
         scratchDirectory: File,
-        frameCount: Int = 4,
+        frameCount: Int = 0,
         hdrStrength: Float = 0.72f,
     ): RawBurst {
         check(loaded) { "Android NDK camera backend is unavailable" }
         scratchDirectory.mkdirs()
+        val requestedFrames = if (frameCount <= 0) 0 else frameCount.coerceIn(1, 8)
         val raw = nativeCaptureBurst(
             scratchDirectory.absolutePath,
-            frameCount.coerceIn(1, 8),
+            requestedFrames,
             hdrStrength.takeIf { it.isFinite() }?.coerceIn(0f, 2f) ?: 0.72f,
         )
         val root = JSONObject(raw)
@@ -196,6 +210,8 @@ object NativeCameraNdkBridge {
             cfaArrangement = cfa,
             rawFormat = root.optInt("rawFormat", 0),
             frames = frames,
+            captureStrategy = root.optString("strategy", "unknown"),
+            previewRestored = root.optBoolean("previewRestored", true),
         )
     }
 
