@@ -28,13 +28,16 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 
 /**
- * Runtime validation for Java Camera2/logical-physical routes.
+ * Fast runtime validation for Java Camera2/logical-physical routes.
  *
- * PHOTO capture intentionally uses the compatibility-first strategy: preview is configured on its
- * own, then shutter briefly switches to a RAW-only session. Therefore a route is user-facing only
- * if BOTH the real preview output and a genuine RAW_SENSOR output can be configured for the same
- * direct/physical lens. This avoids metadata-only false positives without requiring the HAL to
- * support preview + RAW concurrently.
+ * Validation is deliberately session-only: moving a full Bayer frame is capture work, not startup
+ * work. The common path tries one combined preview+RAW session. If a HAL rejects that combination,
+ * we fall back to the compatibility path used by the app at shutter time: preview-only followed by
+ * RAW-only. Physical children sharing one logical parent are batch-probed through a single opened
+ * CameraDevice, avoiding repeated expensive camera opens.
+ *
+ * Probe surfaces use small declared stream sizes. Full-resolution RAW is exercised by the real
+ * capture path and a successful DNG promotes the route to RAW_VERIFIED in the persistent cache.
  */
 class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseable {
     private val appContext = context.applicationContext
@@ -43,11 +46,72 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
         Thread(runnable, "CameraRouteProbe").apply { priority = Thread.NORM_PRIORITY }
     }
 
-    override suspend fun probe(profile: CameraDeviceProfile): CameraRouteProbeResult {
+    override suspend fun probe(profile: CameraDeviceProfile): CameraRouteProbeResult =
+        probeBatch(listOf(profile)).first()
+
+    /**
+     * Opens each logical/direct CameraDevice only once, then validates all selected physical routes
+     * that share it. This is a major cold-start win on logical multi-camera phones.
+     */
+    suspend fun probeBatch(profiles: List<CameraDeviceProfile>): List<CameraRouteProbeResult> {
+        if (profiles.isEmpty()) return emptyList()
         if (appContext.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            return result(profile, CameraRouteProbeStatus.PERMISSION_DENIED, "Camera permission is required")
+            return profiles.map {
+                result(it, CameraRouteProbeStatus.PERMISSION_DENIED, "Camera permission is required")
+            }
         }
 
+        val results = mutableMapOf<String, CameraRouteProbeResult>()
+        profiles.groupBy { it.routeCameraId }.forEach { (cameraId, group) ->
+            val device = try {
+                withTimeout(OPEN_TIMEOUT_MS) { openDevice(cameraId) }
+            } catch (error: TimeoutCancellationException) {
+                group.forEach { profile ->
+                    results[routeKey(profile)] = result(
+                        profile,
+                        CameraRouteProbeStatus.TIMED_OUT,
+                        "Camera open timed out",
+                    )
+                }
+                return@forEach
+            } catch (error: SecurityException) {
+                group.forEach { profile ->
+                    results[routeKey(profile)] = result(
+                        profile,
+                        CameraRouteProbeStatus.PERMISSION_DENIED,
+                        error.message,
+                    )
+                }
+                return@forEach
+            } catch (error: Throwable) {
+                group.forEach { profile ->
+                    results[routeKey(profile)] = result(
+                        profile,
+                        CameraRouteProbeStatus.OPEN_FAILED,
+                        error.message ?: error.javaClass.simpleName,
+                    )
+                }
+                return@forEach
+            }
+
+            try {
+                group.forEach { profile ->
+                    results[routeKey(profile)] = probeOnOpenDevice(device, profile)
+                }
+            } finally {
+                device.close()
+            }
+        }
+        return profiles.map { profile ->
+            results[routeKey(profile)]
+                ?: result(profile, CameraRouteProbeStatus.SESSION_FAILED, "Route probe did not complete")
+        }
+    }
+
+    private suspend fun probeOnOpenDevice(
+        device: CameraDevice,
+        profile: CameraDeviceProfile,
+    ): CameraRouteProbeResult {
         val previewTarget = createPreviewProbeTarget(profile)
             ?: return result(profile, CameraRouteProbeStatus.NO_PROBE_STREAM, "No preview probe stream")
         val rawTarget = createRawProbeTarget(profile)
@@ -58,27 +122,34 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
 
         return previewTarget.use { preview ->
             rawTarget.use { raw ->
-                val device = try {
-                    withTimeout(OPEN_TIMEOUT_MS) { openDevice(profile.routeCameraId) }
-                } catch (error: TimeoutCancellationException) {
-                    return@use result(profile, CameraRouteProbeStatus.TIMED_OUT, "Camera open timed out")
-                } catch (error: SecurityException) {
-                    return@use result(profile, CameraRouteProbeStatus.PERMISSION_DENIED, error.message)
-                } catch (error: Throwable) {
-                    return@use result(
-                        profile,
-                        CameraRouteProbeStatus.OPEN_FAILED,
-                        error.message ?: error.javaClass.simpleName,
-                    )
-                }
-
                 try {
-                    val previewOkay = configureSafely(device, profile, preview.surface, "Preview")
-                        ?: return@use result(
+                    // Fast/common case: one configuration proves both surfaces and avoids two
+                    // session round-trips.
+                    val combined = configureSafely(
+                        device = device,
+                        profile = profile,
+                        surfaces = listOf(preview.surface, raw.surface),
+                        label = "Preview + RAW",
+                    )
+                    if (combined == true) {
+                        return@use result(
                             profile,
-                            CameraRouteProbeStatus.TIMED_OUT,
-                            "Preview session configuration timed out",
+                            CameraRouteProbeStatus.SESSION_CONFIGURED,
+                            "Fast concurrent probe · preview ${preview.size.width}×${preview.size.height} · RAW ${raw.size.width}×${raw.size.height}",
                         )
+                    }
+
+                    // Compatibility path for aux sensors that reject concurrent outputs.
+                    val previewOkay = configureSafely(
+                        device = device,
+                        profile = profile,
+                        surfaces = listOf(preview.surface),
+                        label = "Preview",
+                    ) ?: return@use result(
+                        profile,
+                        CameraRouteProbeStatus.TIMED_OUT,
+                        "Preview session configuration timed out",
+                    )
                     if (!previewOkay) {
                         return@use result(
                             profile,
@@ -87,12 +158,16 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
                         )
                     }
 
-                    val rawOkay = configureSafely(device, profile, raw.surface, "RAW")
-                        ?: return@use result(
-                            profile,
-                            CameraRouteProbeStatus.TIMED_OUT,
-                            "RAW session configuration timed out",
-                        )
+                    val rawOkay = configureSafely(
+                        device = device,
+                        profile = profile,
+                        surfaces = listOf(raw.surface),
+                        label = "RAW",
+                    ) ?: return@use result(
+                        profile,
+                        CameraRouteProbeStatus.TIMED_OUT,
+                        "RAW session configuration timed out",
+                    )
                     if (!rawOkay) {
                         return@use result(
                             profile,
@@ -104,7 +179,7 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
                     result(
                         profile,
                         CameraRouteProbeStatus.SESSION_CONFIGURED,
-                        "Preview ${preview.size.width}×${preview.size.height} · RAW ${raw.size.width}×${raw.size.height} · switch",
+                        "Fast switch probe · preview ${preview.size.width}×${preview.size.height} · RAW ${raw.size.width}×${raw.size.height}",
                     )
                 } catch (error: Throwable) {
                     result(
@@ -112,8 +187,6 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
                         CameraRouteProbeStatus.SESSION_FAILED,
                         error.message ?: error.javaClass.simpleName,
                     )
-                } finally {
-                    device.close()
                 }
             }
         }
@@ -122,11 +195,11 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
     private suspend fun configureSafely(
         device: CameraDevice,
         profile: CameraDeviceProfile,
-        surface: Surface,
+        surfaces: List<Surface>,
         label: String,
     ): Boolean? = try {
         withTimeout(SESSION_TIMEOUT_MS) {
-            configureProbeSession(device, profile, surface)
+            configureProbeSession(device, profile, surfaces)
         }
     } catch (_: TimeoutCancellationException) {
         null
@@ -169,23 +242,33 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
     private suspend fun configureProbeSession(
         device: CameraDevice,
         profile: CameraDeviceProfile,
-        surface: Surface,
+        surfaces: List<Surface>,
     ): Boolean = suspendCancellableCoroutine { continuation ->
         val sessionRef = AtomicReference<CameraCaptureSession?>(null)
-        val output = OutputConfiguration(surface)
-        profile.physicalCameraId?.let(output::setPhysicalCameraId)
+        var outcome: Boolean? = null
+        val outputs = surfaces.map { surface ->
+            OutputConfiguration(surface).apply {
+                profile.physicalCameraId?.let(::setPhysicalCameraId)
+            }
+        }
 
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 sessionRef.set(session)
+                outcome = true
                 session.close()
-                if (continuation.isActive) continuation.resume(true)
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 sessionRef.set(session)
+                outcome = false
                 session.close()
-                if (continuation.isActive) continuation.resume(false)
+            }
+
+            override fun onClosed(session: CameraCaptureSession) {
+                if (sessionRef.compareAndSet(session, null) && continuation.isActive) {
+                    continuation.resume(outcome == true)
+                }
             }
         }
 
@@ -193,7 +276,7 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
             device.createCaptureSession(
                 SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
-                    listOf(output),
+                    outputs,
                     executor,
                     callback,
                 ),
@@ -214,14 +297,19 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
     }
 
     private fun createRawProbeTarget(profile: CameraDeviceProfile): ProbeTarget? {
-        val size = profile.streams.rawSizes.maxByOrNull { it.area } ?: return null
+        // Smallest declared RAW stream is sufficient for fast startup route validation. Real photo
+        // capture still requests the highest RAW resolution and promotes the cache after success.
+        val size = profile.streams.rawSizes.minByOrNull { it.area } ?: return null
         return runCatching { RawProbeTarget(size) }.getOrNull()
     }
 
     private fun choosePreviewSize(sizes: List<PixelSize>): PixelSize? {
         if (sizes.isEmpty()) return null
-        val moderate = sizes.filter { it.width <= 1920 && it.height <= 1080 }
-        return moderate.maxByOrNull { it.area } ?: sizes.minByOrNull { it.area }
+        val normal = sizes.filter { it.width >= 320 && it.height >= 240 }
+        val bounded = normal.filter { it.width <= 1280 && it.height <= 720 }
+        return bounded.minByOrNull { it.area }
+            ?: normal.minByOrNull { it.area }
+            ?: sizes.minByOrNull { it.area }
     }
 
     private fun result(
@@ -290,8 +378,11 @@ class AndroidCameraRouteProbe(context: Context) : CameraRouteProbe, AutoCloseabl
         }
     }
 
+    private fun routeKey(profile: CameraDeviceProfile): String =
+        "${profile.routeCameraId}:${profile.physicalCameraId ?: "direct"}"
+
     private companion object {
-        const val OPEN_TIMEOUT_MS = 3_000L
-        const val SESSION_TIMEOUT_MS = 3_000L
+        const val OPEN_TIMEOUT_MS = 1_800L
+        const val SESSION_TIMEOUT_MS = 1_500L
     }
 }
