@@ -19,6 +19,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: phase/01-foundation-discovery
+          fetch-depth: 0
+
+      - name: Apply preview latency and orientation patch
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/latency_preview_orientation_patch.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            camera-camera2/src/main/kotlin/com/camera/camera/camera2/AndroidCameraCatalog.kt \
+            camera-camera2/src/main/kotlin/com/camera/camera/camera2/NativeCameraNdkBridge.kt \
+            camera-camera2/src/main/cpp/motioncam_camera_ndk.cpp \
+            feature-camera/src/main/kotlin/com/camera/feature/camera/CameraBootstrapScreen.kt \
+            feature-camera/src/main/kotlin/com/camera/feature/camera/Camera2PreviewController.kt \
+            feature-camera/src/main/kotlin/com/camera/feature/camera/ComputationalRawCaptureCoordinator.kt \
+            processing-raw/src/main/kotlin/com/camera/processing/raw/FusedDngWriter.kt
+          git diff --cached --quiet || git commit -m "perf: accelerate preview switching and fix DNG orientation"
+          git push origin HEAD:phase/01-foundation-discovery
 
       - uses: actions/setup-java@v5
         with:
