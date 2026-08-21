@@ -12,10 +12,10 @@ import kotlin.math.roundToInt
 /**
  * Converts the raw Camera2 graph into user-facing photographic lenses.
  *
- * Vendor HALs can publish several Camera2 IDs for the same piece of glass, logical aggregators,
+ * Vendor HALs can publish several Camera2/NDK IDs for the same piece of glass, logical aggregators,
  * physical-member aliases, depth routes and alternate ISP pipelines. The main camera UI must show
  * useful optical cameras, not raw IDs. This resolver therefore classifies by public capability and
- * optical fingerprint rather than hard-coded Qualcomm/Xiaomi camera numbers.
+ * optical fingerprint rather than hard-coded Qualcomm/Xiaomi camera numbers or expected counts.
  *
  * RAW routing is intentionally route-aware. A physical member may omit its own RAW capability and
  * RAW stream map even though its logical parent exposes a RAW output that can be assigned to that
@@ -90,8 +90,12 @@ object ValuableCameraResolver {
             logicalAggregator
         }
 
-        // Collapse vendor aliases only when optical metadata strongly indicates the same camera.
-        // Missing metadata keeps a route separate rather than accidentally hiding real hardware.
+        // Collapse alternate routes to the same physical lens. NDK and Java metadata are not always
+        // byte-for-byte identical: the NDK path can omit aperture tables and can advertise RAW at a
+        // different maximum size from the Java JPEG/remosaic route. Those are pipeline differences,
+        // not extra pieces of glass, so identity is based on facing + focal length + sensor geometry
+        // + active-array geometry (+ CFA when present). This is what prevents a 4-rear/1-front phone
+        // from being presented as 5-rear/2-front simply because the HAL publishes aliases.
         val preferredProfiles = eligible
             .groupBy { profile -> opticalFingerprint(profile) ?: "route:${routeKey(profile)}" }
             .values
@@ -179,6 +183,13 @@ object ValuableCameraResolver {
         if (profile.parentLogicalCameraId != null) score += 20
         if (profile.supportsManualSensor) score += 8
         if (profile.supportsBurstCapture) score += 4
+
+        // If Java/physical Camera2 and an NDK vendor alias describe the same optics, prefer the
+        // framework-visible route. It has richer session negotiation and avoids selecting native
+        // aliases that enumerate successfully but reject preview + RAW. A genuinely NDK-only aux
+        // camera is unaffected because there is no equivalent framework route in its group.
+        if ("NDK_ENUMERATED" !in profile.capabilities) score += 64
+
         score += (profile.maxPhotoPixels / 1_000_000L).coerceAtMost(20L).toInt()
         return score
     }
@@ -201,9 +212,9 @@ object ValuableCameraResolver {
     }
 
     /**
-     * Camera-Computaional-style first-pass identity. The logical parent ID is intentionally not
-     * used when a physical ID exists; this lets a direct vendor alias and its logical/physical
-     * route meet in the same bucket without hard-coded camera numbers.
+     * First-pass route identity. The logical parent ID is intentionally not used when a physical ID
+     * exists; this lets a direct vendor alias and its logical/physical route meet in the same bucket
+     * without hard-coded camera numbers.
      */
     private fun effectiveRouteFingerprint(profile: CameraDeviceProfile): String {
         val effectiveId = profile.physicalCameraId ?: profile.routeCameraId
@@ -215,11 +226,12 @@ object ValuableCameraResolver {
     }
 
     /**
-     * Strong optical identity adapted from the previous Universal-Camera implementation.
+     * Physical optical identity shared by Java Camera2 and NDK ACameraManager aliases.
      *
-     * The exact Camera2 ID is deliberately excluded. Two routes with the same facing, sensor
-     * geometry, active array, focal lengths, equivalent focal lengths, apertures and output scale
-     * are overwhelmingly likely to be vendor aliases for the same physical lens.
+     * Deliberately excluded: route ID, aperture list, stream format list and max output resolution.
+     * Vendors frequently expose those differently for the same sensor through Java, NDK, logical,
+     * remosaic and ISP routes. Including them creates false extra lenses. Sensor/focal/active-array
+     * geometry is substantially more stable across those routes.
      */
     private fun opticalFingerprint(profile: CameraDeviceProfile): String? {
         if (profile.focalLengthsMm.isEmpty()) return null
@@ -240,8 +252,7 @@ object ValuableCameraResolver {
                 sensorWidth?.takeIf { it > 0f }?.let { width -> focal * 36f / width }
             }
             .joinToString(",") { quantize(it, 10f).toString() }
-        val apertures = profile.apertures.sorted()
-            .joinToString(",") { quantize(it, 100f).toString() }
+        val cfa = profile.cfaArrangement ?: "cfa-na"
 
         return buildString {
             append(profile.facing.name)
@@ -266,9 +277,7 @@ object ValuableCameraResolver {
             append('|')
             append(equivalentFocals)
             append('|')
-            append(apertures)
-            append('|')
-            append(profile.maxPhotoPixels)
+            append(cfa)
         }
     }
 
