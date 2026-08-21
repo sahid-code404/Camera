@@ -3,8 +3,10 @@ package com.camera.camera.camera2
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.SurfaceTexture
-import android.view.Surface
+import android.graphics.ImageFormat
+import android.media.ImageReader
+import android.os.Handler
+import android.os.HandlerThread
 import com.camera.camera.api.CameraRouteProbe
 import com.camera.camera.api.CameraRouteProbeResult
 import com.camera.camera.api.CameraRouteProbeStatus
@@ -20,6 +22,11 @@ import kotlinx.coroutines.withContext
  * preview/RAW combination. This probe starts the same adaptive native session used by the UI and
  * acquires one genuine RAW frame. Only routes that pass both operations are allowed into the
  * validated user-facing lens set.
+ *
+ * The probe preview uses a small PRIVATE ImageReader and continuously drains it. A detached
+ * SurfaceTexture can fill its buffer queue when nobody consumes frames, which can make a perfectly
+ * valid camera appear to stall during a RAW probe. Draining the PRIVATE reader avoids that false
+ * negative without ever reading or processing preview pixels.
  */
 class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
     private val appContext = context.applicationContext
@@ -42,12 +49,28 @@ class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
 
         scratchDir.mkdirs()
         scratchDir.listFiles()?.forEach { runCatching { it.delete() } }
-        val texture = SurfaceTexture(false).apply {
-            setDefaultBufferSize(descriptor.previewWidth, descriptor.previewHeight)
+        val drainThread = HandlerThread("NativeRouteProbeDrain").apply { start() }
+        val reader = runCatching {
+            ImageReader.newInstance(
+                descriptor.previewWidth,
+                descriptor.previewHeight,
+                ImageFormat.PRIVATE,
+                PREVIEW_BUFFERS,
+            )
+        }.getOrElse { error ->
+            drainThread.quitSafely()
+            return@withContext result(
+                profile,
+                CameraRouteProbeStatus.NO_PROBE_STREAM,
+                error.message ?: "Unable to create native preview probe target",
+            )
         }
-        val surface = Surface(texture)
+        reader.setOnImageAvailableListener({ source ->
+            runCatching { source.acquireLatestImage()?.close() }
+        }, Handler(drainThread.looper))
+
         try {
-            val startError = NativeCameraNdkBridge.startSession(profile.routeCameraId, surface)
+            val startError = NativeCameraNdkBridge.startSession(profile.routeCameraId, reader.surface)
             if (startError != null) {
                 val status = if (startError.contains("open", ignoreCase = true)) {
                     CameraRouteProbeStatus.OPEN_FAILED
@@ -85,8 +108,9 @@ class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
             )
         } finally {
             NativeCameraNdkBridge.stopSession()
-            runCatching { surface.release() }
-            runCatching { texture.release() }
+            runCatching { reader.setOnImageAvailableListener(null, null) }
+            runCatching { reader.close() }
+            drainThread.quitSafely()
             scratchDir.listFiles()?.forEach { runCatching { it.delete() } }
         }
     }
@@ -101,4 +125,8 @@ class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
         status = status,
         message = message,
     )
+
+    private companion object {
+        const val PREVIEW_BUFFERS = 3
+    }
 }
