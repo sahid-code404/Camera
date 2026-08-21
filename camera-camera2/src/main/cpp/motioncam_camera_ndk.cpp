@@ -6,8 +6,10 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
