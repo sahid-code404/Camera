@@ -119,7 +119,7 @@ internal class Camera2PreviewController(
             if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) > 0) {
                 builder.set(CaptureRequest.CONTROL_AF_REGIONS, null)
             }
-            if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) {
+            if ((characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
                 builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
             }
             setBestContinuousAf(builder, characteristics)
@@ -584,11 +584,6 @@ internal class Camera2PreviewController(
         )
     }
 
-    /**
-     * A lens is native-only when it was discovered through ACameraManager but the Java camera ID
-     * list does not expose it. Java logical/physical routes remain on Camera2 because they already
-     * work there and retain focus/zoom behavior.
-     */
     private fun nativeDescriptorFor(lens: ValuableLens): NativeCameraNdkBridge.Descriptor? {
         if (lens.physicalCameraId != null || lens.cameraId in javaCameraIds) return null
         return NativeCameraNdkBridge.descriptor(lens.cameraId)
