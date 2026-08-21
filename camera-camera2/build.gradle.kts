@@ -5,9 +5,20 @@ plugins {
 android {
     namespace = "com.camera.camera.camera2"
     compileSdk = 37
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         minSdk = 28
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     compileOptions {
