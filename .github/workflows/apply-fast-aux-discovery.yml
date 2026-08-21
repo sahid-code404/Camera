@@ -36,6 +36,7 @@ jobs:
             camera-camera2/src/main/kotlin/com/camera/camera/camera2/ValidatedCameraCatalog.kt \
             camera-camera2/src/main/kotlin/com/camera/camera/camera2/CameraRouteValidationCache.kt \
             camera-camera2/src/main/cpp/motioncam_camera_ndk.cpp \
+            camera-camera2/src/main/cpp/native_camera_session.cpp \
             feature-camera/src/main/kotlin/com/camera/feature/camera/Camera2PreviewController.kt \
             feature-camera/src/main/kotlin/com/camera/feature/camera/CameraBootstrapScreen.kt
           if git diff --cached --quiet; then
