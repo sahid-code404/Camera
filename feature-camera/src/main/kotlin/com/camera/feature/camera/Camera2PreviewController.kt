@@ -679,7 +679,7 @@ internal class Camera2PreviewController(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val useCases = activeCharacteristics
                     ?.get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES)
-                    .orEmpty()
+                    ?: longArrayOf()
                 if (useCases.contains(CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong())) {
                     output.streamUseCase = CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong()
                 }
