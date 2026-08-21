@@ -521,9 +521,6 @@ private fun CameraStatus(
         captureState is PhotoCaptureState.Saving -> {
             Text("Native DNG processing…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
         }
-        snapshot == null -> {
-            Text("Validating RAW camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
-        }
         previewState is PreviewState.Opening -> {
             Text("Opening camera…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
         }
