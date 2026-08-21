@@ -107,7 +107,11 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
                     }
                     if (childHadNoPhotoStreams && parent.maxPhotoPixels > 0L) {
                         child = child.copy(
-                            streams = parent.streams,
+                            streams = if (parentHasFrameworkRaw) {
+                                parent.streams
+                            } else {
+                                parent.streams.copy(rawSizes = emptyList())
+                            },
                             supportsRaw = child.supportsRaw || parentHasFrameworkRaw,
                             discoveryWarnings = child.discoveryWarnings +
                                 "Inherited logical-parent stream candidates",

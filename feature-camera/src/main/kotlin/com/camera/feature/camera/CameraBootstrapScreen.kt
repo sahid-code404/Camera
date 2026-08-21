@@ -104,6 +104,7 @@ fun CameraBootstrapScreen() {
                 PackageManager.PERMISSION_GRANTED,
         )
     }
+    var deepDiscoveryDone by remember { mutableStateOf(false) }
 
     val controller = remember(context) {
         Camera2PreviewController(
@@ -138,10 +139,23 @@ fun CameraBootstrapScreen() {
             .getOrNull()
         if (fast != null) {
             snapshot = fast
-            kotlinx.coroutines.yield()
-            runCatching { catalog.scanValidated(context, deepScan = true) }
-                .onSuccess { deep -> snapshot = deep }
+            deepDiscoveryDone = false
+            if (fast.valuableLenses.none { it.rawSupported }) {
+                runCatching { catalog.scanValidated(context, deepScan = true) }
+                    .onSuccess { deep -> snapshot = deep }
+                deepDiscoveryDone = true
+            }
         }
+    }
+
+    LaunchedEffect(cameraPermissionGranted, previewState, deepDiscoveryDone) {
+        if (!cameraPermissionGranted || deepDiscoveryDone || previewState !is PreviewState.Streaming) {
+            return@LaunchedEffect
+        }
+        deepDiscoveryDone = true
+        kotlinx.coroutines.delay(250L)
+        runCatching { catalog.scanValidated(context, deepScan = true) }
+            .onSuccess { deep -> snapshot = deep }
     }
 
     LaunchedEffect(snapshot?.valuableLenses) {
