@@ -3,6 +3,7 @@ project(camera_ndk_bridge LANGUAGES CXX)
 
 add_library(camera_ndk_bridge SHARED
     motioncam_camera_ndk.cpp
+    native_camera_session.cpp
 )
 
 target_compile_features(camera_ndk_bridge PRIVATE cxx_std_17)
