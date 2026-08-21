@@ -28,6 +28,24 @@ data class RawFrame(
     val sensorToLinearSrgb: FloatArray,
 )
 
+/**
+ * Same tightly packed Bayer payload as [RawFrame], but sourced from Android NDK AImageReader.
+ * Keeping this Android-framework-free lets hidden auxiliary cameras use the same native
+ * computational processor without fabricating a Java CaptureResult.
+ */
+data class NativeRawFrame(
+    val timestampNs: Long,
+    val width: Int,
+    val height: Int,
+    val file: File,
+    val exposureTimeNs: Long,
+    val iso: Int,
+    val blackLevels: IntArray,
+    val whiteLevel: Int,
+    val awbGains: FloatArray,
+    val sensorToLinearSrgb: FloatArray,
+)
+
 data class RawAlignment(
     val dx: Int,
     val dy: Int,
@@ -41,6 +59,17 @@ data class FusedRaw(
     val file: File,
     val referenceResult: CaptureResult,
     val referenceCharacteristics: CameraCharacteristics,
+    val frameCount: Int,
+    val alignments: List<RawAlignment>,
+    val acceptedSamples: Long,
+    val rejectedSamples: Long,
+)
+
+/** Native-camera equivalent of [FusedRaw]. The generated file is the same complete Linear DNG. */
+data class NativeFusedRaw(
+    val width: Int,
+    val height: Int,
+    val file: File,
     val frameCount: Int,
     val alignments: List<RawAlignment>,
     val acceptedSamples: Long,
