@@ -1110,8 +1110,10 @@ internal class Camera2PreviewController(
     private fun emitCapture(state: PhotoCaptureState) =
         mainHandler.post { if (!released) onCaptureState(state) }
 
-    private fun lensKey(lens: ValuableLens, targetAspect: Float?): String =
-        "${lens.cameraId}:${lens.physicalCameraId ?: "direct"}:a${aspectKey(targetAspect)}"
+    private fun lensKey(lens: ValuableLens, targetAspect: Float?): String {
+        val transport = if (lens.nativeRoutePreferred && lens.physicalCameraId == null) "native" else "java"
+        return "${lens.cameraId}:${lens.physicalCameraId ?: "direct"}:$transport:a${aspectKey(targetAspect)}"
+    }
 
     private fun aspectKey(value: Float?): Int =
         value?.takeIf { it.isFinite() && it > 0f }?.let { (it * 1000f).toInt() } ?: 0
