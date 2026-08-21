@@ -21,6 +21,10 @@ import kotlin.math.roundToInt
  * RAW stream map even though its logical parent exposes a RAW output that can be assigned to that
  * physical sensor with OutputConfiguration.setPhysicalCameraId(). Such a child is kept as a RAW
  * candidate and the actual RAW capture session is the final authority.
+ *
+ * When [validatedRouteKeys] is supplied it is applied BEFORE alias selection. This is important:
+ * if the normally preferred Java alias fails its runtime RAW probe, an equivalent verified NDK
+ * route must be allowed to become the selected route rather than being hidden by the failed alias.
  */
 object ValuableCameraResolver {
     data class Resolution(
@@ -35,9 +39,24 @@ object ValuableCameraResolver {
         if (profiles.isEmpty()) return Resolution(emptyList(), emptySet())
 
         val hidden = mutableSetOf<String>()
+
+        // RAW reachability is calculated against the complete metadata graph. A validated physical
+        // child can still depend on RAW stream metadata owned by its logical parent even if that
+        // parent is not itself a user-facing validated route.
         val rawRouteKeys = profiles
             .filter { profile -> hasDirectRawSensorOutput(profile) || hasParentRawRoute(profile, profiles) }
             .mapTo(mutableSetOf(), ::routeKey)
+
+        val candidateProfiles = if (validatedRouteKeys == null) {
+            profiles
+        } else {
+            profiles.filter { routeKey(it) in validatedRouteKeys }.also { candidates ->
+                val candidateKeys = candidates.mapTo(mutableSetOf(), ::routeKey)
+                profiles.filterNot { routeKey(it) in candidateKeys }
+                    .forEach { hidden += routeKey(it) }
+            }
+        }
+        if (candidateProfiles.isEmpty()) return Resolution(emptyList(), hidden)
 
         val routeComparator = Comparator<CameraDeviceProfile> { left, right ->
             val score = routePreferenceScore(right, rawRouteKeys).compareTo(
@@ -58,7 +77,7 @@ object ValuableCameraResolver {
         // Camera HALs often expose the same sensor twice: once as a directly enumerated camera and
         // once as a physical member of a logical parent. Match those routes using the effective
         // sensor ID plus optics, then keep the route with the strongest real RAW path.
-        val routeCandidates = profiles
+        val routeCandidates = candidateProfiles
             .groupBy(::effectiveRouteFingerprint)
             .values
             .map { group ->
@@ -70,9 +89,8 @@ object ValuableCameraResolver {
 
         val eligible = routeCandidates.filter { profile ->
             val photographic = isPhotographicRoute(profile)
-            val validated = validatedRouteKeys == null || routeKey(profile) in validatedRouteKeys
-            if (!photographic || !validated) hidden += routeKey(profile)
-            photographic && validated
+            if (!photographic) hidden += routeKey(profile)
+            photographic
         }.filterNot { profile ->
             // Hide a logical aggregator only when a preferred child can replace it. A parent RAW
             // output may be the transport used to reach a physical child, so children that inherit
@@ -94,8 +112,8 @@ object ValuableCameraResolver {
         // byte-for-byte identical: the NDK path can omit aperture tables and can advertise RAW at a
         // different maximum size from the Java JPEG/remosaic route. Those are pipeline differences,
         // not extra pieces of glass, so identity is based on facing + focal length + sensor geometry
-        // + active-array geometry (+ CFA when present). This is what prevents a 4-rear/1-front phone
-        // from being presented as 5-rear/2-front simply because the HAL publishes aliases.
+        // + active-array geometry (+ CFA when present). This prevents a 4-rear/1-front phone from
+        // being presented as 5-rear/2-front simply because the HAL publishes aliases.
         val preferredProfiles = eligible
             .groupBy { profile -> opticalFingerprint(profile) ?: "route:${routeKey(profile)}" }
             .values
@@ -185,9 +203,9 @@ object ValuableCameraResolver {
         if (profile.supportsBurstCapture) score += 4
 
         // If Java/physical Camera2 and an NDK vendor alias describe the same optics, prefer the
-        // framework-visible route. It has richer session negotiation and avoids selecting native
-        // aliases that enumerate successfully but reject preview + RAW. A genuinely NDK-only aux
-        // camera is unaffected because there is no equivalent framework route in its group.
+        // framework-visible route. It has richer session negotiation. If runtime validation later
+        // rejects it, candidate filtering happens before this comparator and the verified NDK alias
+        // can take over.
         if ("NDK_ENUMERATED" !in profile.capabilities) score += 64
 
         score += (profile.maxPhotoPixels / 1_000_000L).coerceAtMost(20L).toInt()
