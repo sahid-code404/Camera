@@ -11,10 +11,11 @@ import com.camera.core.model.ValuableLens
 /**
  * Lightning-fast catalog validation.
  *
- * Startup performs metadata discovery only. It never opens every candidate camera. Previously
- * rejected aliases are removed immediately, while verified aliases retain their trust annotation.
- * The selected lens is validated naturally by the real preview session; successful preview/DNG
- * operations promote the cache from metadata -> SESSION -> RAW.
+ * Progressive startup validates the tiny primary front/back metadata snapshot first, then reuses
+ * the same cache filtering for advertised and deep AUX discovery after the viewfinder is usable.
+ * It never opens every candidate camera. Previously rejected aliases are removed immediately,
+ * while verified aliases retain their trust annotation. The selected lens is validated naturally
+ * by the real preview session; successful preview/DNG operations promote metadata -> SESSION -> RAW.
  */
 suspend fun AndroidCameraCatalog.scanPrimaryValidated(
     context: Context,
