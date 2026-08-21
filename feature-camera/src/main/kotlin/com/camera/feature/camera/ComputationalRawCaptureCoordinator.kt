@@ -39,6 +39,10 @@ import kotlin.math.pow
  * logical parent. The ImageReader is still RAW_SENSOR and OutputConfiguration.setPhysicalCameraId()
  * routes that RAW surface to the selected physical sensor. If the HAL rejects that combination,
  * capture fails explicitly rather than falling back to JPEG/YUV.
+ *
+ * Burst length is light-adaptive. Bright scenes use four samples; progressively darker/high-ISO
+ * scenes use up to eight. This keeps daytime latency/memory low while giving low-light fusion more
+ * independent sensor samples without an always-on full-resolution RAW ring buffer.
  */
 internal class ComputationalRawCaptureCoordinator(
     context: android.content.Context,
@@ -53,10 +57,9 @@ internal class ComputationalRawCaptureCoordinator(
     private var active: BurstState? = null
 
     fun supports(characteristics: CameraCharacteristics): Boolean {
-        // PHOTO lens eligibility is already decided by the route-aware catalog. A physical member
-        // can legitimately have no standalone RAW stream map while its logical parent owns the RAW
-        // stream that will be assigned to this physical camera. The real session is validated in
-        // capture(); never synthesize RAW from a processed stream.
+        // PHOTO lens eligibility is already decided by the route-aware, runtime-validated catalog.
+        // A physical member can legitimately have no standalone RAW stream map while its logical
+        // parent owns the RAW stream that is assigned to this physical camera.
         return true
     }
 
@@ -92,13 +95,17 @@ internal class ComputationalRawCaptureCoordinator(
             preferred = captureCharacteristics,
             fallback = rawStreamCharacteristics,
         )
+        val expectedFrames = adaptiveFrameCount(
+            previewResult = latestPreviewResult,
+            characteristics = captureCharacteristics,
+        )
 
         val myGeneration = ++generation
         val reader = ImageReader.newInstance(
             rawSize.width,
             rawSize.height,
             ImageFormat.RAW_SENSOR,
-            FRAME_COUNT + 2,
+            expectedFrames + RAW_READER_HEADROOM,
         )
         val state = BurstState(
             generation = myGeneration,
@@ -106,6 +113,7 @@ internal class ComputationalRawCaptureCoordinator(
             characteristics = sensorCharacteristics,
             settings = settings,
             targetAspect = targetAspect.takeIf { it.isFinite() && it > 0f } ?: 4f / 3f,
+            expectedFrames = expectedFrames,
             reader = reader,
             onAcquisitionFinished = onAcquisitionFinished,
             onProcessing = onProcessing,
@@ -157,6 +165,7 @@ internal class ComputationalRawCaptureCoordinator(
                             characteristics = captureCharacteristics,
                             previewResult = latestPreviewResult,
                             settings = settings,
+                            frameCount = expectedFrames,
                         )
                         session.captureBurst(
                             requests,
@@ -174,10 +183,10 @@ internal class ComputationalRawCaptureCoordinator(
                                         fail(state, "RAW capture result has no sensor timestamp")
                                         return
                                     }
-                                    // Some Qualcomm physical-result payloads omit the AWB/color
-                                    // transform even though the logical TotalCaptureResult contains
-                                    // valid values for the same exposure. Use the physical result
-                                    // only when it carries a complete color calibration payload.
+                                    // Some physical-result payloads omit AWB/color transforms even
+                                    // though the logical result contains valid calibration for the
+                                    // same exposure. Prefer complete physical metadata, otherwise use
+                                    // the logical result rather than inventing calibration values.
                                     val metadata = if (
                                         physical.get(CaptureResult.COLOR_CORRECTION_GAINS) != null &&
                                         physical.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) != null
@@ -273,6 +282,7 @@ internal class ComputationalRawCaptureCoordinator(
         characteristics: CameraCharacteristics,
         previewResult: TotalCaptureResult?,
         settings: PhotoLensSettings,
+        frameCount: Int,
     ): List<CaptureRequest> {
         val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?: intArrayOf()
@@ -299,10 +309,16 @@ internal class ComputationalRawCaptureCoordinator(
 
         val hdr = settings.hdrEnabled ?: true
         val strength = (settings.hdrStrength ?: 0.72f).coerceIn(0f, 2f)
-        val offsets = if (hdr && manual) {
-            listOf(-2.0f * strength, -1.0f * strength, 0f, 0f)
-        } else {
-            List(FRAME_COUNT) { 0f }
+        val offsets = List(frameCount) { index ->
+            if (!hdr || !manual) {
+                0f
+            } else {
+                when (index) {
+                    0 -> -2.0f * strength
+                    1 -> -1.0f * strength
+                    else -> 0f
+                }
+            }
         }
 
         return offsets.map { ev ->
@@ -350,6 +366,34 @@ internal class ComputationalRawCaptureCoordinator(
         }
     }
 
+    /**
+     * Conservative exposure/ISO heuristic. It intentionally bottoms out at four frames to preserve
+     * the current HDR fusion behavior and grows only when photon noise is likely to dominate.
+     */
+    private fun adaptiveFrameCount(
+        previewResult: TotalCaptureResult?,
+        characteristics: CameraCharacteristics,
+    ): Int {
+        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val iso = previewResult?.get(CaptureResult.SENSOR_SENSITIVITY)
+            ?: isoRange?.lower
+            ?: 100
+        val exposureNs = previewResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+            ?: exposureRange?.lower?.coerceAtLeast(DEFAULT_EXPOSURE_NS)
+            ?: DEFAULT_EXPOSURE_NS
+        val exposureMs = exposureNs.coerceAtLeast(1L).toDouble() / 1_000_000.0
+        val isoScale = (iso.coerceAtLeast(1).toDouble() / 100.0).coerceAtLeast(1.0)
+        val lightCost = exposureMs * isoScale
+        return when {
+            lightCost >= 140.0 -> 8
+            lightCost >= 70.0 -> 7
+            lightCost >= 32.0 -> 6
+            lightCost >= 12.0 -> 5
+            else -> 4
+        }
+    }
+
     private fun pairLocked(state: BurstState, timestamp: Long) {
         val payload = state.payloads[timestamp] ?: return
         val result = state.results[timestamp] ?: return
@@ -360,11 +404,11 @@ internal class ComputationalRawCaptureCoordinator(
 
     private fun maybeStartProcessing(state: BurstState) {
         val frames = synchronized(state.lock) {
-            if (!isActive(state) || state.processingStarted || state.frames.size < FRAME_COUNT) {
+            if (!isActive(state) || state.processingStarted || state.frames.size < state.expectedFrames) {
                 null
             } else {
                 state.processingStarted = true
-                state.frames.take(FRAME_COUNT).toList()
+                state.frames.take(state.expectedFrames).toList()
             }
         } ?: return
 
@@ -384,6 +428,7 @@ internal class ComputationalRawCaptureCoordinator(
                     val description = buildString {
                         append("Camera native computational Linear DNG")
                         append(" · frames=${frames.size}")
+                        append(" · adaptive=true")
                         append(" · hdr=${state.settings.hdrEnabled ?: true}")
                         append(" · saturation=${state.settings.saturation ?: 1f}")
                         append(" · sharpness=${state.settings.sharpness ?: 0.28f}")
@@ -503,6 +548,7 @@ internal class ComputationalRawCaptureCoordinator(
         val characteristics: CameraCharacteristics,
         val settings: PhotoLensSettings,
         val targetAspect: Float,
+        val expectedFrames: Int,
         val reader: ImageReader,
         val onAcquisitionFinished: () -> Unit,
         val onProcessing: (Int) -> Unit,
@@ -519,8 +565,8 @@ internal class ComputationalRawCaptureCoordinator(
     }
 
     private companion object {
-        const val FRAME_COUNT = 4
-        const val RAW_TIMEOUT_MS = 12_000L
+        const val RAW_READER_HEADROOM = 2
+        const val RAW_TIMEOUT_MS = 18_000L
         const val DEFAULT_EXPOSURE_NS = 10_000_000L
         const val FRAME_MARGIN_NS = 1_000_000L
     }
