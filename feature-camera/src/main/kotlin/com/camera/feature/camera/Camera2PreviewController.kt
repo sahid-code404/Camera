@@ -587,8 +587,8 @@ internal class Camera2PreviewController(
         activePreviewSize = size
         texture.setDefaultBufferSize(size.width, size.height)
         configureTransformForSize(view.width, view.height, size, targetAspect)
-        val surface = Surface(texture)
-        previewSurface = surface
+        val surface = previewSurface?.takeIf { it.isValid }
+            ?: Surface(texture).also { previewSurface = it }
         val error = NativeCameraNdkBridge.startSession(lens.cameraId, surface)
         opening = false
         if (error != null) {
