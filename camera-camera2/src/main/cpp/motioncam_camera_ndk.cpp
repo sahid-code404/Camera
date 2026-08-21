@@ -92,10 +92,12 @@ std::vector<SizePair> streamSizes(const ACameraMetadata* metadata, int wantedFor
 }
 
 SizePair chooseRaw(const ACameraMetadata* metadata) {
-    auto raw16 = streamSizes(metadata, AIMAGE_FORMAT_RAW16);
-    if (!raw16.empty()) return raw16.front();
-    auto raw10 = streamSizes(metadata, AIMAGE_FORMAT_RAW10);
-    if (!raw10.empty()) return raw10.front();
+    // Prefer unpacked RAW16. RAW12 and RAW10 are also genuine Bayer sensor outputs and are unpacked
+    // into 16-bit samples by the native capture path before computational processing.
+    for (const int format : {AIMAGE_FORMAT_RAW16, AIMAGE_FORMAT_RAW12, AIMAGE_FORMAT_RAW10}) {
+        auto sizes = streamSizes(metadata, format);
+        if (!sizes.empty()) return sizes.front();
+    }
     return {};
 }
 
@@ -142,10 +144,12 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
     }
     std::unique_ptr<ACameraMetadata, decltype(&ACameraMetadata_free)> metadata(metadataRaw, ACameraMetadata_free);
 
-    const bool rawCap = hasCapability(metadata.get(), ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_RAW);
+    const bool rawCapabilityAdvertised = hasCapability(metadata.get(), ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_RAW);
     const SizePair raw = chooseRaw(metadata.get());
-    const bool rawSupported = rawCap && raw.width > 0 && raw.height > 0;
-    if (!rawSupported) return {};
+    // Stream configuration is the final metadata-level evidence. Some vendor/physical camera blocks
+    // publish a legitimate RAW stream while omitting the RAW capability flag, so do not discard a
+    // real RAW10/12/16 stream solely because that redundant bit is missing.
+    if (raw.width <= 0 || raw.height <= 0) return {};
 
     const SizePair preview = choosePreview(metadata.get(), raw);
     if (preview.width <= 0 || preview.height <= 0) return {};
@@ -158,7 +162,8 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
     int activeWidth = raw.width;
     int activeHeight = raw.height;
     int cfa = -1;
-    int white = raw.format == AIMAGE_FORMAT_RAW10 ? 1023 : 65535;
+    int white = raw.format == AIMAGE_FORMAT_RAW10 ? 1023 :
+        (raw.format == AIMAGE_FORMAT_RAW12 ? 4095 : 65535);
     int black[4] = {0, 0, 0, 0};
     int isoMin = 0;
     int isoMax = 0;
@@ -196,9 +201,10 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
 
     std::ostringstream out;
     out << '{'
-        << "\"id\":\"" << jsonEscape(cameraId) << "\"," 
+        << "\"id\":\"" << jsonEscape(cameraId) << "\","
         << "\"facing\":" << facing << ','
-        << "\"hardware\":\"" << hardwareLevelName(static_cast<uint8_t>(hardware)) << "\"," 
+        << "\"hardware\":\"" << hardwareLevelName(static_cast<uint8_t>(hardware)) << "\","
+        << "\"rawCapabilityAdvertised\":" << (rawCapabilityAdvertised ? "true" : "false") << ','
         << "\"rawFormat\":" << raw.format << ','
         << "\"rawWidth\":" << raw.width << ','
         << "\"rawHeight\":" << raw.height << ','
@@ -238,6 +244,7 @@ std::string enumerateJson() {
     std::ostringstream out;
     out << '[';
     bool first = true;
+    int rawCount = 0;
     for (int i = 0; i < idList->numCameras; ++i) {
         const char* id = idList->cameraIds[i];
         if (id == nullptr) continue;
@@ -245,10 +252,16 @@ std::string enumerateJson() {
         if (description.empty()) continue;
         if (!first) out << ',';
         first = false;
+        ++rawCount;
         out << description;
     }
     out << ']';
-    __android_log_print(ANDROID_LOG_INFO, TAG, "NDK RAW discovery found %d framework-visible IDs before filtering", idList->numCameras);
+    __android_log_print(
+        ANDROID_LOG_INFO,
+        TAG,
+        "NDK discovery enumerated %d IDs and retained %d genuine RAW routes",
+        idList->numCameras,
+        rawCount);
     return out.str();
 }
 } // namespace
