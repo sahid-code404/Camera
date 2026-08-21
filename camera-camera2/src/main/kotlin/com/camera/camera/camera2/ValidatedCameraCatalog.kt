@@ -17,9 +17,9 @@ import com.camera.core.model.ValuableLens
  * while verified aliases retain their trust annotation. The selected lens is validated naturally
  * by the real preview session; successful preview/DNG operations promote metadata -> SESSION -> RAW.
  */
-suspend fun AndroidCameraCatalog.scanPrimaryValidated(
+suspend fun AndroidCameraCatalog.scanPrimaryRearValidated(
     context: Context,
-): CameraCatalogSnapshot = validateMetadata(context, scanPrimaryCameras())
+): CameraCatalogSnapshot = validateMetadata(context, scanPrimaryRearCamera())
 
 suspend fun AndroidCameraCatalog.scanValidated(
     context: Context,

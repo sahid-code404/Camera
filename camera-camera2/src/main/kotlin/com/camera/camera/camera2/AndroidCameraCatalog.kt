@@ -19,6 +19,11 @@ import com.camera.core.model.LensFacing
 import com.camera.core.model.LongValueRange
 import com.camera.core.model.PixelSize
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -36,20 +41,20 @@ import org.json.JSONObject
  */
 class AndroidCameraCatalog(context: Context) : CameraCatalog {
     private val manager = context.applicationContext.getSystemService(CameraManager::class.java)
+    // Bounded metadata concurrency avoids serial discovery without flooding weak HALs.
+    private val metadataSlots = Semaphore(4)
 
     override suspend fun scan(): CameraCatalogSnapshot = scan(deepScan = false)
 
     /**
-     * Critical-path startup scan. Resolve only the first framework-compatible rear and front
-     * cameras, stopping as soon as both are known. This deliberately avoids NDK enumeration,
-     * logical physical-member expansion, and hidden AUX probing so first preview can start with
-     * the least possible camera-service work.
+     * Absolute critical-path startup scan. Resolve the first normal framework rear camera and
+     * return immediately. Front/AUX/NDK discovery is intentionally excluded so Compose can bind
+     * the rear viewfinder while all remaining metadata work runs concurrently in the background.
      */
-    suspend fun scanPrimaryCameras(): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
+    suspend fun scanPrimaryRearCamera(): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
         val javaIds = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
-        var firstBack: Pair<String, CameraCharacteristics>? = null
-        var firstFront: Pair<String, CameraCharacteristics>? = null
         var firstCompatible: Pair<String, CameraCharacteristics>? = null
+        var firstBack: Pair<String, CameraCharacteristics>? = null
 
         for (id in javaIds) {
             val chars = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: continue
@@ -61,29 +66,25 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
                 continue
             }
             if (firstCompatible == null) firstCompatible = id to chars
-            when (facingOf(chars.get(CameraCharacteristics.LENS_FACING))) {
-                LensFacing.BACK -> if (firstBack == null) firstBack = id to chars
-                LensFacing.FRONT -> if (firstFront == null) firstFront = id to chars
-                else -> Unit
+            if (facingOf(chars.get(CameraCharacteristics.LENS_FACING)) == LensFacing.BACK) {
+                firstBack = id to chars
+                break
             }
-            if (firstBack != null && firstFront != null) break
         }
 
-        val selected = buildList {
-            firstBack?.let(::add)
-            firstFront?.let { front -> if (none { it.first == front.first }) add(front) }
-            if (isEmpty()) firstCompatible?.let(::add)
-        }
-        val profiles = selected.map { (id, chars) ->
-            buildJavaProfile(
-                routeCameraId = id,
-                physicalCameraId = null,
-                parentLogicalCameraId = null,
-                routeKind = CameraRouteKind.ENUMERATED,
-                characteristics = chars,
-                inheritedFacing = null,
+        val selected = firstBack ?: firstCompatible
+        val profiles = selected?.let { (id, chars) ->
+            listOf(
+                buildJavaProfile(
+                    routeCameraId = id,
+                    physicalCameraId = null,
+                    parentLogicalCameraId = null,
+                    routeKind = CameraRouteKind.ENUMERATED,
+                    characteristics = chars,
+                    inheritedFacing = null,
+                ),
             )
-        }
+        }.orEmpty()
         val resolution = ValuableCameraResolver.resolve(profiles)
         CameraCatalogSnapshot(
             deviceProfiles = profiles,
@@ -99,20 +100,31 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
 
     suspend fun scan(deepScan: Boolean): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
         val javaIds = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
-        val enumerated = javaIds.mapNotNull { id ->
-            runCatching {
-                buildJavaProfile(
-                    routeCameraId = id,
-                    physicalCameraId = null,
-                    parentLogicalCameraId = null,
-                    routeKind = CameraRouteKind.ENUMERATED,
-                    characteristics = manager.getCameraCharacteristics(id),
-                    inheritedFacing = null,
-                )
-            }.getOrNull()
+
+        // Java Camera2 and NDK metadata are independent read-only work: execute both at once.
+        val (enumerated, ndkDescriptors) = coroutineScope {
+            val ndkDeferred = async(Dispatchers.Default) {
+                NativeCameraNdkBridge.enumerateRawCameras(deepScan = deepScan)
+            }
+            val javaDeferred = javaIds.map { id ->
+                async(Dispatchers.IO) {
+                    metadataSlots.withPermit {
+                        runCatching {
+                            buildJavaProfile(
+                                routeCameraId = id,
+                                physicalCameraId = null,
+                                parentLogicalCameraId = null,
+                                routeKind = CameraRouteKind.ENUMERATED,
+                                characteristics = manager.getCameraCharacteristics(id),
+                                inheritedFacing = null,
+                            )
+                        }.getOrNull()
+                    }
+                }
+            }
+            javaDeferred.awaitAll().filterNotNull() to ndkDeferred.await()
         }
 
-        val ndkDescriptors = NativeCameraNdkBridge.enumerateRawCameras(deepScan = deepScan)
         val ndkById = ndkDescriptors.associateBy { it.id }
         val enrichedEnumerated = enumerated.map { profile ->
             val native = ndkById[profile.routeCameraId]
@@ -133,51 +145,51 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
             }
         }
 
-        val physicalMembers = buildList {
-            enrichedEnumerated.forEach { parent ->
-                parent.logicalPhysicalIds.forEach physical@ { physicalId ->
-                    val chars = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
-                        ?: return@physical
-                    var child = buildJavaProfile(
-                        routeCameraId = parent.routeCameraId,
-                        physicalCameraId = physicalId,
-                        parentLogicalCameraId = parent.routeCameraId,
-                        routeKind = CameraRouteKind.LOGICAL_PHYSICAL_MEMBER,
-                        characteristics = chars,
-                        inheritedFacing = parent.facing,
-                    )
-                    val childHadNoPhotoStreams = child.maxPhotoPixels == 0L
-
-                    // API 29+ physical cameras may omit a standalone stream configuration map while
-                    // still being routable through the logical parent. Preserve the parent's stream
-                    // declarations as candidates and let the real session decide whether that
-                    // physical route works.
-                    val parentHasFrameworkRaw =
-                        parent.streams.rawSizes.isNotEmpty() &&
-                            "NDK_RAW_PREFERRED" !in parent.capabilities
-                    if (child.streams.rawSizes.isEmpty() && parentHasFrameworkRaw) {
-                        child = child.copy(
-                            streams = child.streams.copy(rawSizes = parent.streams.rawSizes),
-                            supportsRaw = true,
-                            discoveryWarnings = child.discoveryWarnings +
-                                "Inherited logical-parent RAW_SENSOR candidates",
-                        )
+        // Logical physical-member metadata is also read concurrently with a conservative cap.
+        val physicalMembers = coroutineScope {
+            enrichedEnumerated.flatMap { parent ->
+                parent.logicalPhysicalIds.map { physicalId ->
+                    async(Dispatchers.IO) {
+                        metadataSlots.withPermit {
+                            val chars = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
+                                ?: return@withPermit null
+                            var child = buildJavaProfile(
+                                routeCameraId = parent.routeCameraId,
+                                physicalCameraId = physicalId,
+                                parentLogicalCameraId = parent.routeCameraId,
+                                routeKind = CameraRouteKind.LOGICAL_PHYSICAL_MEMBER,
+                                characteristics = chars,
+                                inheritedFacing = parent.facing,
+                            )
+                            val childHadNoPhotoStreams = child.maxPhotoPixels == 0L
+                            val parentHasFrameworkRaw =
+                                parent.streams.rawSizes.isNotEmpty() &&
+                                    "NDK_RAW_PREFERRED" !in parent.capabilities
+                            if (child.streams.rawSizes.isEmpty() && parentHasFrameworkRaw) {
+                                child = child.copy(
+                                    streams = child.streams.copy(rawSizes = parent.streams.rawSizes),
+                                    supportsRaw = true,
+                                    discoveryWarnings = child.discoveryWarnings +
+                                        "Inherited logical-parent RAW_SENSOR candidates",
+                                )
+                            }
+                            if (childHadNoPhotoStreams && parent.maxPhotoPixels > 0L) {
+                                child = child.copy(
+                                    streams = if (parentHasFrameworkRaw) {
+                                        parent.streams
+                                    } else {
+                                        parent.streams.copy(rawSizes = emptyList())
+                                    },
+                                    supportsRaw = child.supportsRaw || parentHasFrameworkRaw,
+                                    discoveryWarnings = child.discoveryWarnings +
+                                        "Inherited logical-parent stream candidates",
+                                )
+                            }
+                            child
+                        }
                     }
-                    if (childHadNoPhotoStreams && parent.maxPhotoPixels > 0L) {
-                        child = child.copy(
-                            streams = if (parentHasFrameworkRaw) {
-                                parent.streams
-                            } else {
-                                parent.streams.copy(rawSizes = emptyList())
-                            },
-                            supportsRaw = child.supportsRaw || parentHasFrameworkRaw,
-                            discoveryWarnings = child.discoveryWarnings +
-                                "Inherited logical-parent stream candidates",
-                        )
-                    }
-                    add(child)
                 }
-            }
+            }.awaitAll().filterNotNull()
         }
 
         val javaRouteKeys = (enrichedEnumerated + physicalMembers)

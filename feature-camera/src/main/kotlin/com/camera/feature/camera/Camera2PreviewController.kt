@@ -590,8 +590,8 @@ internal class Camera2PreviewController(
 
     private fun nativeDescriptorFor(lens: ValuableLens): NativeCameraNdkBridge.Descriptor? {
         if (lens.physicalCameraId != null) return null
-        val descriptor = NativeCameraNdkBridge.descriptor(lens.cameraId) ?: return null
-        return descriptor.takeIf { lens.nativeRoutePreferred || lens.cameraId !in javaCameraIds }
+        if (!lens.nativeRoutePreferred && lens.cameraId in javaCameraIds) return null
+        return NativeCameraNdkBridge.descriptor(lens.cameraId)
     }
 
     private fun handleRecoverableCameraLoss(camera: CameraDevice, lens: ValuableLens) {

@@ -49,7 +49,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.camera2.AndroidCameraCatalog
-import com.camera.camera.camera2.scanPrimaryValidated
+import com.camera.camera.camera2.scanPrimaryRearValidated
 import com.camera.camera.camera2.scanValidated
 import com.camera.core.model.LensFacing
 import com.camera.core.model.PhotoLensSettings
@@ -105,7 +105,7 @@ fun CameraBootstrapScreen() {
                 PackageManager.PERMISSION_GRANTED,
         )
     }
-    // 0=primary-only, 1=advertised routes complete, 2=deep hidden-AUX complete.
+    // 0=rear preview seed, 1=advertised routes complete, 2=deep hidden-AUX complete.
     var discoveryStage by remember { mutableStateOf(0) }
 
     val controller = remember(context) {
@@ -135,62 +135,49 @@ fun CameraBootstrapScreen() {
         discoveryError = null
         discoveryStage = 0
 
-        // First-frame path: inspect only enough framework metadata to find the normal rear main
-        // and normal front camera. Do not touch NDK/physical/hidden AUX discovery yet.
-        val primaryResult = runCatching { catalog.scanPrimaryValidated(context) }
+        // Critical path: return as soon as the first normal rear camera is known.
+        val primaryResult = runCatching { catalog.scanPrimaryRearValidated(context) }
         val primary = primaryResult.getOrNull()
-        if (primary != null && primary.valuableLenses.any { it.rawSupported }) {
+        if (primary != null && primary.valuableLenses.isNotEmpty()) {
             snapshot = primary
             return@LaunchedEffect
         }
 
-        // Some OEMs expose RAW for the main route only through the native alias. If the micro-scan
-        // cannot produce a usable RAW preview, fall back immediately to advertised metadata so the
-        // app still starts instead of waiting for a preview that can never stream.
         val advertisedResult = runCatching { catalog.scanValidated(context, deepScan = false) }
-        val advertised = advertisedResult.getOrNull()
-        if (advertised != null) {
-            snapshot = advertised
-            discoveryStage = 1
-        }
-        if (advertised != null && advertised.valuableLenses.any { it.rawSupported }) {
-            return@LaunchedEffect
-        }
-
-        // No advertised RAW route: only now pay for the bounded hidden numeric AUX scan.
-        val deepResult = runCatching { catalog.scanValidated(context, deepScan = true) }
-        deepResult.onSuccess { deep -> snapshot = deep }
-        discoveryStage = 2
+        advertisedResult.onSuccess { advertised -> snapshot = advertised }
+        discoveryStage = 1
         if (snapshot == null) {
-            val failure = deepResult.exceptionOrNull()
-                ?: advertisedResult.exceptionOrNull()
-                ?: primaryResult.exceptionOrNull()
+            val failure = advertisedResult.exceptionOrNull() ?: primaryResult.exceptionOrNull()
             discoveryError = failure?.message ?: failure?.javaClass?.simpleName ?: "Camera discovery failed"
         }
     }
 
-    LaunchedEffect(cameraPermissionGranted, previewState) {
-        if (!cameraPermissionGranted || discoveryStage >= 2) return@LaunchedEffect
-        val previewReady = previewState is PreviewState.Streaming
-        val previewFailed = previewState is PreviewState.Error
-        if (!previewReady && !previewFailed) return@LaunchedEffect
+    LaunchedEffect(cameraPermissionGranted, snapshot, discoveryStage) {
+        if (!cameraPermissionGranted || snapshot == null || discoveryStage != 0) return@LaunchedEffect
 
-        // Let the first rear-main preview frame win the camera-service/CPU race. Discovery resumes
-        // only after the user already has a working viewfinder. A failed primary preview skips the
-        // cosmetic settle delay so alternate routes can be found immediately.
-        if (previewReady) kotlinx.coroutines.delay(120L)
+        // One UI turn gives TextureView/openCamera first dispatch; metadata then runs in parallel.
+        kotlinx.coroutines.yield()
+        val advertisedResult = runCatching { catalog.scanValidated(context, deepScan = false) }
+        advertisedResult.onSuccess { advertised -> snapshot = advertised }
+        discoveryStage = 1
+    }
 
-        if (discoveryStage == 0) {
-            runCatching { catalog.scanValidated(context, deepScan = false) }
-                .onSuccess { advertised -> snapshot = advertised }
-            discoveryStage = 1
+    LaunchedEffect(cameraPermissionGranted, previewState, discoveryStage, snapshot) {
+        if (!cameraPermissionGranted || discoveryStage != 1) return@LaunchedEffect
+        val hasRawRoute = snapshot?.valuableLenses?.any { it.rawSupported } == true
+        when {
+            previewState is PreviewState.Streaming -> kotlinx.coroutines.delay(80L)
+            previewState is PreviewState.Error -> Unit
+            !hasRawRoute -> Unit
+            else -> return@LaunchedEffect
         }
 
-        if (previewReady) kotlinx.coroutines.delay(250L)
-        if (discoveryStage == 1) {
-            runCatching { catalog.scanValidated(context, deepScan = true) }
-                .onSuccess { deep -> snapshot = deep }
-            discoveryStage = 2
+        val deepResult = runCatching { catalog.scanValidated(context, deepScan = true) }
+        deepResult.onSuccess { deep -> snapshot = deep }
+        discoveryStage = 2
+        if (deepResult.isFailure && snapshot == null) {
+            val failure = deepResult.exceptionOrNull()
+            discoveryError = failure?.message ?: failure?.javaClass?.simpleName ?: "Camera discovery failed"
         }
     }
 
@@ -204,26 +191,26 @@ fun CameraBootstrapScreen() {
         .filter { lens -> storedConfigs[lens.id.value]?.visible != false }
         .sortedBy { lens -> storedConfigs[lens.id.value]?.position ?: lens.userOrder }
 
-    // PHOTO is DNG-only. Do not fake RAW with a processed route. Other modes may use the full
-    // valuable-lens list later when their native pipelines are implemented.
+    // Capture remains genuine-RAW-only. Preview can use normal rear while NDK RAW is discovered.
     val photoLenses = allVisibleLenses.filter { it.rawSupported }
+    val previewLenses = if (photoLenses.isNotEmpty()) photoLenses else allVisibleLenses
 
-    val mainIndex = photoLenses.indexOfFirst { lens ->
+    val mainIndex = previewLenses.indexOfFirst { lens ->
         val config = storedConfigs[lens.id.value]
         val anchor = config?.displayZoomAnchor ?: lens.displayZoomAnchor
         lens.facing == LensFacing.BACK && anchor?.let { abs(it - 1f) < 0.18f } == true
     }.let { index ->
         when {
             index >= 0 -> index
-            photoLenses.indexOfFirst { it.facing == LensFacing.BACK } >= 0 ->
-                photoLenses.indexOfFirst { it.facing == LensFacing.BACK }
+            previewLenses.indexOfFirst { it.facing == LensFacing.BACK } >= 0 ->
+                previewLenses.indexOfFirst { it.facing == LensFacing.BACK }
             else -> 0
         }
     }
 
-    val selectedLens = photoLenses.firstOrNull { it.id.value == selectedLensId }
-        ?: photoLenses.getOrNull(mainIndex)
-    val facingLenses = photoLenses.filter { lens -> lens.facing == selectedLens?.facing }
+    val selectedLens = previewLenses.firstOrNull { it.id.value == selectedLensId }
+        ?: previewLenses.getOrNull(mainIndex)
+    val facingLenses = previewLenses.filter { lens -> lens.facing == selectedLens?.facing }
 
     LaunchedEffect(selectedLens?.id?.value) {
         if (selectedLens != null && selectedLensId != selectedLens.id.value) {
@@ -307,6 +294,7 @@ fun CameraBootstrapScreen() {
                         captureState = captureState,
                         permissionGranted = cameraPermissionGranted,
                         rawLensCount = photoLenses.size,
+                        discoveryComplete = discoveryStage >= 2,
                         onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
                     )
 
@@ -378,7 +366,7 @@ fun CameraBootstrapScreen() {
                             }
                         }
 
-                        val shutterReady = selectedLens != null &&
+                        val shutterReady = selectedLens?.rawSupported == true &&
                             previewState is PreviewState.Streaming &&
                             captureState !is PhotoCaptureState.Capturing &&
                             captureState !is PhotoCaptureState.Saving
@@ -522,6 +510,7 @@ private fun CameraStatus(
     captureState: PhotoCaptureState,
     permissionGranted: Boolean,
     rawLensCount: Int,
+    discoveryComplete: Boolean,
     onRequestPermission: () -> Unit,
 ) {
     when {
@@ -539,7 +528,7 @@ private fun CameraStatus(
                 Text(discoveryError, color = Color.White.copy(alpha = 0.72f), fontSize = 10.sp)
             }
         }
-        snapshot != null && rawLensCount == 0 -> {
+        snapshot != null && rawLensCount == 0 && discoveryComplete -> {
             Text("No enabled lens exposes RAW_SENSOR", color = Color(0xFFFF8A80), fontSize = 13.sp)
         }
         previewState is PreviewState.Error -> {
