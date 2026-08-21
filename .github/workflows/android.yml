@@ -29,8 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/lightning_startup_patch.py
-          git show 7faa55248e9ea5940d039501c8ab4f2b530afb7d:.github/workflows/android.yml > .github/workflows/android.yml
-          rm -f .github/workflows/lightning-parallel-startup.yml scripts/lightning_startup_patch.py
+          rm -f scripts/lightning_startup_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -- \
@@ -38,8 +37,6 @@ jobs:
             camera-camera2/src/main/kotlin/com/camera/camera/camera2/ValidatedCameraCatalog.kt \
             feature-camera/src/main/kotlin/com/camera/feature/camera/CameraBootstrapScreen.kt \
             feature-camera/src/main/kotlin/com/camera/feature/camera/Camera2PreviewController.kt \
-            .github/workflows/android.yml \
-            .github/workflows/lightning-parallel-startup.yml \
             scripts/lightning_startup_patch.py
           git commit -m "perf: parallelize lightning camera startup"
           git push origin HEAD:phase/01-foundation-discovery
