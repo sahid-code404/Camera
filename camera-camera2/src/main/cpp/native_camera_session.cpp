@@ -11,10 +11,13 @@
 #include <media/NdkImageReader.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -26,8 +29,8 @@
 
 namespace {
 constexpr const char* TAG = "CameraNativeSession";
-constexpr int kRawReaderBuffers = 8;
-constexpr int kCaptureTimeoutSeconds = 12;
+constexpr int kRawReaderBuffers = 10;
+constexpr int kCaptureTimeoutSeconds = 16;
 
 struct RawConfig {
     int width = 0;
@@ -61,6 +64,20 @@ struct StagedImage {
     int height = 0;
     std::string path;
 };
+
+enum class SessionStrategy {
+    NONE,
+    CONCURRENT_PREVIEW_RAW,
+    SWITCH_PREVIEW_RAW,
+};
+
+const char* strategyName(SessionStrategy strategy) {
+    switch (strategy) {
+        case SessionStrategy::CONCURRENT_PREVIEW_RAW: return "concurrent";
+        case SessionStrategy::SWITCH_PREVIEW_RAW: return "switch";
+        default: return "none";
+    }
+}
 
 std::string jsonEscape(const std::string& value) {
     std::ostringstream out;
@@ -98,17 +115,16 @@ bool hasCapability(const ACameraMetadata* metadata, uint8_t wanted) {
 
 bool chooseRawConfig(const ACameraMetadata* metadata, RawConfig* config) {
     if (metadata == nullptr || config == nullptr) return false;
-    if (!hasCapability(metadata, ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_RAW)) return false;
 
     struct Candidate { int width; int height; int format; int64_t area; };
     Candidate best{0, 0, 0, 0};
     ACameraMetadata_const_entry streams{};
     if (!getEntry(metadata, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &streams)) return false;
 
-    // Prefer RAW16 because the existing computational engine consumes tightly packed 16-bit Bayer.
-    // RAW10 remains supported and is expanded to 16-bit values in the image callback.
-    for (int pass = 0; pass < 2 && best.area == 0; ++pass) {
-        const int wanted = pass == 0 ? AIMAGE_FORMAT_RAW16 : AIMAGE_FORMAT_RAW10;
+    // Stream presence is stronger evidence than the redundant RAW capability bit on some vendor
+    // physical-camera blocks. Prefer unpacked RAW16, then RAW12, then RAW10.
+    for (const int wanted : {AIMAGE_FORMAT_RAW16, AIMAGE_FORMAT_RAW12, AIMAGE_FORMAT_RAW10}) {
+        Candidate formatBest{0, 0, 0, 0};
         for (uint32_t i = 0; i + 3 < streams.count; i += 4) {
             const int format = streams.data.i32[i];
             const int width = streams.data.i32[i + 1];
@@ -116,7 +132,11 @@ bool chooseRawConfig(const ACameraMetadata* metadata, RawConfig* config) {
             const int input = streams.data.i32[i + 3];
             if (input != 0 || format != wanted || width <= 0 || height <= 0) continue;
             const int64_t area = static_cast<int64_t>(width) * height;
-            if (area > best.area) best = {width, height, format, area};
+            if (area > formatBest.area) formatBest = {width, height, format, area};
+        }
+        if (formatBest.area > 0) {
+            best = formatBest;
+            break;
         }
     }
     if (best.area <= 0) return false;
@@ -124,7 +144,8 @@ bool chooseRawConfig(const ACameraMetadata* metadata, RawConfig* config) {
     config->width = best.width;
     config->height = best.height;
     config->format = best.format;
-    config->whiteLevel = best.format == AIMAGE_FORMAT_RAW10 ? 1023 : 65535;
+    config->whiteLevel = best.format == AIMAGE_FORMAT_RAW10 ? 1023 :
+        (best.format == AIMAGE_FORMAT_RAW12 ? 4095 : 65535);
 
     ACameraMetadata_const_entry entry{};
     if (getEntry(metadata, ACAMERA_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT, &entry) && entry.count > 0) {
@@ -179,6 +200,18 @@ CaptureMeta readCaptureMeta(const ACameraMetadata* metadata, const CaptureMeta& 
     return result;
 }
 
+int adaptiveFrameCount(int requestedFrames, const CaptureMeta& base) {
+    if (requestedFrames > 0) return std::max(1, std::min(requestedFrames, 8));
+    const double exposureMs = std::max(0.001, static_cast<double>(base.exposureTimeNs) / 1.0e6);
+    const double isoScale = std::max(1.0, static_cast<double>(std::max(1, base.iso)) / 100.0);
+    const double lightCost = exposureMs * isoScale;
+    if (lightCost >= 140.0) return 8;
+    if (lightCost >= 70.0) return 7;
+    if (lightCost >= 32.0) return 6;
+    if (lightCost >= 12.0) return 5;
+    return 4;
+}
+
 class NativeCameraSession {
 public:
     NativeCameraSession() = default;
@@ -188,7 +221,7 @@ public:
         std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
         stopLocked();
         cameraId_ = cameraId;
-        alive_ = true;
+        alive_.store(true);
 
         manager_ = ACameraManager_create();
         if (manager_ == nullptr) return failStartLocked("Unable to create NDK camera manager");
@@ -198,7 +231,7 @@ public:
             return failStartLocked("NDK camera characteristics unavailable");
         }
         if (!chooseRawConfig(characteristics_, &rawConfig_)) {
-            return failStartLocked("NDK camera has no genuine RAW16/RAW10 output");
+            return failStartLocked("NDK camera has no genuine RAW16/RAW12/RAW10 output");
         }
         if (rawConfig_.cfa < 0 || rawConfig_.cfa > 3) {
             return failStartLocked("NDK RAW camera has unsupported Bayer CFA");
@@ -234,19 +267,14 @@ public:
             return failStartLocked("Unable to acquire RAW reader window");
         }
 
-        if (ACaptureSessionOutputContainer_create(&outputContainer_) != ACAMERA_OK || outputContainer_ == nullptr) {
-            return failStartLocked("Unable to create NDK output container");
-        }
-        if (ACaptureSessionOutput_create(previewWindow_, &previewOutput_) != ACAMERA_OK || previewOutput_ == nullptr ||
-            ACaptureSessionOutputContainer_add(outputContainer_, previewOutput_) != ACAMERA_OK) {
-            return failStartLocked("Unable to add NDK preview output");
+        if (ACaptureSessionOutput_create(previewWindow_, &previewOutput_) != ACAMERA_OK || previewOutput_ == nullptr) {
+            return failStartLocked("Unable to create NDK preview output");
         }
         if (ACameraOutputTarget_create(previewWindow_, &previewTarget_) != ACAMERA_OK || previewTarget_ == nullptr) {
             return failStartLocked("Unable to create NDK preview target");
         }
-        if (ACaptureSessionOutput_create(rawWindow_, &rawOutput_) != ACAMERA_OK || rawOutput_ == nullptr ||
-            ACaptureSessionOutputContainer_add(outputContainer_, rawOutput_) != ACAMERA_OK) {
-            return failStartLocked("Unable to add NDK RAW output");
+        if (ACaptureSessionOutput_create(rawWindow_, &rawOutput_) != ACAMERA_OK || rawOutput_ == nullptr) {
+            return failStartLocked("Unable to create NDK RAW output");
         }
         if (ACameraOutputTarget_create(rawWindow_, &rawTarget_) != ACAMERA_OK || rawTarget_ == nullptr) {
             return failStartLocked("Unable to create NDK RAW target");
@@ -260,40 +288,29 @@ public:
             return failStartLocked("Unable to target NDK preview surface");
         }
         configureAutomaticRequest(previewRequest_, false);
+        initializeCallbacks();
 
-        ACameraCaptureSession_stateCallbacks sessionCallbacks{};
-        sessionCallbacks.context = this;
-        sessionCallbacks.onClosed = onSessionClosed;
-        sessionCallbacks.onReady = onSessionReady;
-        sessionCallbacks.onActive = onSessionActive;
-        if (ACameraDevice_createCaptureSession(
-                device_, outputContainer_, &sessionCallbacks, &captureSession_) != ACAMERA_OK ||
-            captureSession_ == nullptr) {
-            return failStartLocked("NDK camera rejected preview + RAW session");
+        // Best path: keep preview + RAW outputs configured together. Some OEM auxiliary cameras
+        // reject that combination even though each output is valid independently. In that case we
+        // keep a preview-only session and switch briefly to a RAW-only session on shutter.
+        if (rebuildSessionLocked(true, true)) {
+            strategy_ = SessionStrategy::CONCURRENT_PREVIEW_RAW;
+        } else if (rebuildSessionLocked(true, false)) {
+            strategy_ = SessionStrategy::SWITCH_PREVIEW_RAW;
+        } else {
+            return failStartLocked("NDK camera rejected both concurrent and preview-only sessions");
         }
 
-        previewCallbacks_ = {};
-        previewCallbacks_.context = this;
-        previewCallbacks_.onCaptureStarted = onPreviewStarted;
-        previewCallbacks_.onCaptureProgressed = onPreviewProgressed;
-        previewCallbacks_.onCaptureCompleted = onPreviewCompleted;
-        previewCallbacks_.onCaptureFailed = onPreviewFailed;
-        previewCallbacks_.onCaptureSequenceCompleted = onPreviewSequenceCompleted;
-        previewCallbacks_.onCaptureSequenceAborted = onPreviewSequenceAborted;
-        previewCallbacks_.onCaptureBufferLost = onPreviewBufferLost;
-
-        ACaptureRequest* previewRequests[] = {previewRequest_};
-        int sequenceId = 0;
-        if (ACameraCaptureSession_setRepeatingRequest(
-                captureSession_, &previewCallbacks_, 1, previewRequests, &sequenceId) != ACAMERA_OK) {
+        if (!startPreviewRepeatingLocked()) {
             return failStartLocked("Unable to start NDK camera preview");
         }
 
         __android_log_print(
             ANDROID_LOG_INFO,
             TAG,
-            "Opened NDK camera %s RAW=%dx%d format=%d",
-            cameraId.c_str(), rawConfig_.width, rawConfig_.height, rawConfig_.format);
+            "Opened NDK camera %s RAW=%dx%d format=%d strategy=%s",
+            cameraId.c_str(), rawConfig_.width, rawConfig_.height, rawConfig_.format,
+            strategyName(strategy_));
         return {};
     }
 
@@ -303,20 +320,12 @@ public:
     }
 
     std::string captureBurst(const std::string& cacheDir, int requestedFrames, float hdrStrength) {
-        const int frameCount = std::max(1, std::min(requestedFrames, 8));
+        std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex_);
         std::unique_lock<std::mutex> captureLock(captureMutex_);
-        if (!alive_ || captureSession_ == nullptr || device_ == nullptr || rawTarget_ == nullptr) {
+        if (!alive_.load() || device_ == nullptr || rawTarget_ == nullptr || strategy_ == SessionStrategy::NONE) {
             return errorJson("NDK camera session is not active");
         }
         if (captureActive_) return errorJson("NDK RAW capture already in progress");
-
-        captureActive_ = true;
-        captureError_.clear();
-        captureSequenceDone_ = false;
-        expectedFrames_ = frameCount;
-        captureCacheDir_ = cacheDir;
-        capturedImages_.clear();
-        capturedMetadata_.clear();
 
         CaptureMeta base;
         {
@@ -326,6 +335,30 @@ public:
         base.iso = std::max(rawConfig_.isoMin, std::min(base.iso, rawConfig_.isoMax));
         base.exposureTimeNs = std::max(rawConfig_.exposureMinNs,
             std::min(base.exposureTimeNs, rawConfig_.exposureMaxNs));
+        const int frameCount = adaptiveFrameCount(requestedFrames, base);
+        const RawConfig captureConfig = rawConfig_;
+        const SessionStrategy captureStrategy = strategy_;
+
+        captureActive_ = true;
+        captureError_.clear();
+        captureSequenceDone_ = false;
+        expectedFrames_ = frameCount;
+        captureCacheDir_ = cacheDir;
+        capturedImages_.clear();
+        capturedMetadata_.clear();
+
+        if (captureStrategy == SessionStrategy::SWITCH_PREVIEW_RAW) {
+            if (!rebuildSessionLocked(false, true)) {
+                resetCaptureLocked();
+                const bool restored = rebuildSessionLocked(true, false) && startPreviewRepeatingLocked();
+                return errorJson(restored
+                    ? "NDK camera rejected RAW-only capture session"
+                    : "NDK camera rejected RAW-only session and preview could not be restored");
+            }
+        } else if (captureSession_ == nullptr) {
+            resetCaptureLocked();
+            return errorJson("NDK concurrent RAW session is unavailable");
+        }
 
         std::vector<ACaptureRequest*> requests;
         requests.reserve(frameCount);
@@ -336,40 +369,38 @@ public:
                 request == nullptr) {
                 freeRequests(requests);
                 resetCaptureLocked();
+                if (captureStrategy == SessionStrategy::SWITCH_PREVIEW_RAW) {
+                    rebuildSessionLocked(true, false);
+                    startPreviewRepeatingLocked();
+                }
                 return errorJson("Unable to create NDK RAW still request");
             }
             if (ACaptureRequest_addTarget(request, rawTarget_) != ACAMERA_OK) {
                 ACaptureRequest_free(request);
                 freeRequests(requests);
                 resetCaptureLocked();
+                if (captureStrategy == SessionStrategy::SWITCH_PREVIEW_RAW) {
+                    rebuildSessionLocked(true, false);
+                    startPreviewRepeatingLocked();
+                }
                 return errorJson("Unable to target NDK RAW output");
             }
 
-            if (rawConfig_.manualSensor) {
-                // Match the Java computational capture policy: two darker HDR samples followed by
-                // two base exposures. This keeps the processing algorithm unchanged.
+            if (captureConfig.manualSensor) {
+                // Two highlight-protection exposures, then base exposures. Extra low-light frames
+                // are base exposures so fusion gains SNR without darkening every sample.
                 float ev = 0.f;
                 if (index == 0) ev = -2.f * strength;
                 else if (index == 1) ev = -1.f * strength;
                 const double scale = std::pow(2.0, static_cast<double>(ev));
                 int64_t exposure = static_cast<int64_t>(static_cast<double>(base.exposureTimeNs) * scale);
-                exposure = std::max(rawConfig_.exposureMinNs, std::min(exposure, rawConfig_.exposureMaxNs));
-                configureManualRequest(request, base.iso, exposure);
+                exposure = std::max(captureConfig.exposureMinNs, std::min(exposure, captureConfig.exposureMaxNs));
+                configureManualRequest(request, base.iso, exposure, captureConfig);
             } else {
                 configureAutomaticRequest(request, true);
             }
             requests.push_back(request);
         }
-
-        stillCallbacks_ = {};
-        stillCallbacks_.context = this;
-        stillCallbacks_.onCaptureStarted = onStillStarted;
-        stillCallbacks_.onCaptureProgressed = onStillProgressed;
-        stillCallbacks_.onCaptureCompleted = onStillCompleted;
-        stillCallbacks_.onCaptureFailed = onStillFailed;
-        stillCallbacks_.onCaptureSequenceCompleted = onStillSequenceCompleted;
-        stillCallbacks_.onCaptureSequenceAborted = onStillSequenceAborted;
-        stillCallbacks_.onCaptureBufferLost = onStillBufferLost;
 
         int sequenceId = 0;
         const camera_status_t submit = ACameraCaptureSession_capture(
@@ -377,8 +408,16 @@ public:
         if (submit != ACAMERA_OK) {
             freeRequests(requests);
             resetCaptureLocked();
+            if (captureStrategy == SessionStrategy::SWITCH_PREVIEW_RAW) {
+                rebuildSessionLocked(true, false);
+                startPreviewRepeatingLocked();
+            }
             return errorJson("NDK RAW burst submission failed");
         }
+
+        // Device/session lifetime only has to be held through submission. stop() can now abort the
+        // sequence safely and wake the condition variable if the app backgrounds or changes lens.
+        lifecycleLock.unlock();
 
         const bool completed = captureCv_.wait_for(
             captureLock,
@@ -390,36 +429,49 @@ public:
             });
 
         freeRequests(requests);
+        std::string failure;
         if (!completed) {
-            const auto staged = capturedImages_;
-            resetCaptureLocked();
-            deleteStaged(staged);
-            return errorJson("NDK RAW burst timed out");
-        }
-        if (!captureError_.empty()) {
-            const std::string error = captureError_;
-            const auto staged = capturedImages_;
-            resetCaptureLocked();
-            deleteStaged(staged);
-            return errorJson(error);
-        }
-        if (static_cast<int>(capturedImages_.size()) < frameCount) {
-            const auto staged = capturedImages_;
-            resetCaptureLocked();
-            deleteStaged(staged);
-            return errorJson("NDK RAW burst returned too few frames");
+            failure = "NDK RAW burst timed out";
+        } else if (!captureError_.empty()) {
+            failure = captureError_;
+        } else if (static_cast<int>(capturedImages_.size()) < frameCount) {
+            failure = "NDK RAW burst returned too few frames";
         }
 
-        std::sort(capturedImages_.begin(), capturedImages_.end(), [](const StagedImage& a, const StagedImage& b) {
-            return a.timestampNs < b.timestampNs;
-        });
-        const auto images = capturedImages_;
-        const auto metadata = capturedMetadata_;
+        std::vector<StagedImage> images;
+        std::map<int64_t, CaptureMeta> metadata;
+        if (failure.empty()) {
+            std::sort(capturedImages_.begin(), capturedImages_.end(), [](const StagedImage& a, const StagedImage& b) {
+                return a.timestampNs < b.timestampNs;
+            });
+            images = capturedImages_;
+            metadata = capturedMetadata_;
+        } else {
+            images = capturedImages_;
+        }
         resetCaptureLocked();
+        captureLock.unlock();
+
+        bool previewRestored = true;
+        if (captureStrategy == SessionStrategy::SWITCH_PREVIEW_RAW && alive_.load()) {
+            std::lock_guard<std::mutex> restoreLock(lifecycleMutex_);
+            if (alive_.load()) {
+                previewRestored = rebuildSessionLocked(true, false) && startPreviewRepeatingLocked();
+            }
+        }
+
+        if (!failure.empty()) {
+            deleteStaged(images);
+            if (!previewRestored) failure += "; preview restoration failed";
+            return errorJson(failure);
+        }
 
         std::ostringstream json;
-        json << "{\"ok\":true,\"cfa\":" << rawConfig_.cfa
-             << ",\"rawFormat\":" << rawConfig_.format
+        json << "{\"ok\":true,\"cfa\":" << captureConfig.cfa
+             << ",\"rawFormat\":" << captureConfig.format
+             << ",\"frameCount\":" << frameCount
+             << ",\"strategy\":\"" << strategyName(captureStrategy) << "\""
+             << ",\"previewRestored\":" << (previewRestored ? "true" : "false")
              << ",\"frames\":[";
         for (size_t i = 0; i < images.size() && static_cast<int>(i) < frameCount; ++i) {
             if (i) json << ',';
@@ -441,17 +493,17 @@ public:
                 meta = nearest->second;
             }
             json << '{'
-                 << "\"path\":\"" << jsonEscape(image.path) << "\"," 
+                 << "\"path\":\"" << jsonEscape(image.path) << "\","
                  << "\"timestampNs\":" << image.timestampNs << ','
                  << "\"width\":" << image.width << ','
                  << "\"height\":" << image.height << ','
                  << "\"exposureTimeNs\":" << meta.exposureTimeNs << ','
                  << "\"iso\":" << meta.iso << ','
-                 << "\"whiteLevel\":" << rawConfig_.whiteLevel << ','
+                 << "\"whiteLevel\":" << captureConfig.whiteLevel << ','
                  << "\"blackLevels\":[";
             for (int j = 0; j < 4; ++j) {
                 if (j) json << ',';
-                json << rawConfig_.blackLevels[j];
+                json << captureConfig.blackLevels[j];
             }
             json << "],\"awbGains\":[";
             for (int j = 0; j < 4; ++j) {
@@ -470,6 +522,97 @@ public:
     }
 
 private:
+    void initializeCallbacks() {
+        previewCallbacks_ = {};
+        previewCallbacks_.context = this;
+        previewCallbacks_.onCaptureStarted = onPreviewStarted;
+        previewCallbacks_.onCaptureProgressed = onPreviewProgressed;
+        previewCallbacks_.onCaptureCompleted = onPreviewCompleted;
+        previewCallbacks_.onCaptureFailed = onPreviewFailed;
+        previewCallbacks_.onCaptureSequenceCompleted = onPreviewSequenceCompleted;
+        previewCallbacks_.onCaptureSequenceAborted = onPreviewSequenceAborted;
+        previewCallbacks_.onCaptureBufferLost = onPreviewBufferLost;
+
+        stillCallbacks_ = {};
+        stillCallbacks_.context = this;
+        stillCallbacks_.onCaptureStarted = onStillStarted;
+        stillCallbacks_.onCaptureProgressed = onStillProgressed;
+        stillCallbacks_.onCaptureCompleted = onStillCompleted;
+        stillCallbacks_.onCaptureFailed = onStillFailed;
+        stillCallbacks_.onCaptureSequenceCompleted = onStillSequenceCompleted;
+        stillCallbacks_.onCaptureSequenceAborted = onStillSequenceAborted;
+        stillCallbacks_.onCaptureBufferLost = onStillBufferLost;
+    }
+
+    bool rebuildSessionLocked(bool includePreview, bool includeRaw) {
+        closeSessionLocked();
+        if (device_ == nullptr) return false;
+        if (ACaptureSessionOutputContainer_create(&outputContainer_) != ACAMERA_OK || outputContainer_ == nullptr) {
+            return false;
+        }
+        containerHasPreview_ = false;
+        containerHasRaw_ = false;
+
+        if (includePreview) {
+            if (previewOutput_ == nullptr ||
+                ACaptureSessionOutputContainer_add(outputContainer_, previewOutput_) != ACAMERA_OK) {
+                closeSessionLocked();
+                return false;
+            }
+            containerHasPreview_ = true;
+        }
+        if (includeRaw) {
+            if (rawOutput_ == nullptr ||
+                ACaptureSessionOutputContainer_add(outputContainer_, rawOutput_) != ACAMERA_OK) {
+                closeSessionLocked();
+                return false;
+            }
+            containerHasRaw_ = true;
+        }
+
+        ACameraCaptureSession_stateCallbacks callbacks{};
+        callbacks.context = this;
+        callbacks.onClosed = onSessionClosed;
+        callbacks.onReady = onSessionReady;
+        callbacks.onActive = onSessionActive;
+        const camera_status_t status = ACameraDevice_createCaptureSession(
+            device_, outputContainer_, &callbacks, &captureSession_);
+        if (status != ACAMERA_OK || captureSession_ == nullptr) {
+            closeSessionLocked();
+            return false;
+        }
+        return true;
+    }
+
+    bool startPreviewRepeatingLocked() {
+        if (captureSession_ == nullptr || previewRequest_ == nullptr || !containerHasPreview_) return false;
+        ACaptureRequest* previewRequests[] = {previewRequest_};
+        int sequenceId = 0;
+        return ACameraCaptureSession_setRepeatingRequest(
+            captureSession_, &previewCallbacks_, 1, previewRequests, &sequenceId) == ACAMERA_OK;
+    }
+
+    void closeSessionLocked() {
+        if (captureSession_ != nullptr) {
+            ACameraCaptureSession_stopRepeating(captureSession_);
+            ACameraCaptureSession_abortCaptures(captureSession_);
+            ACameraCaptureSession_close(captureSession_);
+            captureSession_ = nullptr;
+        }
+        if (outputContainer_ != nullptr) {
+            if (containerHasPreview_ && previewOutput_ != nullptr) {
+                ACaptureSessionOutputContainer_remove(outputContainer_, previewOutput_);
+            }
+            if (containerHasRaw_ && rawOutput_ != nullptr) {
+                ACaptureSessionOutputContainer_remove(outputContainer_, rawOutput_);
+            }
+            ACaptureSessionOutputContainer_free(outputContainer_);
+            outputContainer_ = nullptr;
+        }
+        containerHasPreview_ = false;
+        containerHasRaw_ = false;
+    }
+
     void configureAutomaticRequest(ACaptureRequest* request, bool still) {
         uint8_t control = ACAMERA_CONTROL_MODE_AUTO;
         uint8_t ae = ACAMERA_CONTROL_AE_MODE_ON;
@@ -487,14 +630,18 @@ private:
         }
     }
 
-    void configureManualRequest(ACaptureRequest* request, int iso, int64_t exposureNs) {
+    void configureManualRequest(
+        ACaptureRequest* request,
+        int iso,
+        int64_t exposureNs,
+        const RawConfig& config) {
         uint8_t control = ACAMERA_CONTROL_MODE_AUTO;
         uint8_t ae = ACAMERA_CONTROL_AE_MODE_OFF;
         uint8_t awb = ACAMERA_CONTROL_AWB_MODE_AUTO;
         uint8_t af = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_PICTURE;
         uint8_t intent = ACAMERA_CONTROL_CAPTURE_INTENT_STILL_CAPTURE;
-        int32_t sensitivity = std::max(rawConfig_.isoMin, std::min(iso, rawConfig_.isoMax));
-        int64_t exposure = std::max(rawConfig_.exposureMinNs, std::min(exposureNs, rawConfig_.exposureMaxNs));
+        int32_t sensitivity = std::max(config.isoMin, std::min(iso, config.isoMax));
+        int64_t exposure = std::max(config.exposureMinNs, std::min(exposureNs, config.exposureMaxNs));
         ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_MODE, 1, &control);
         ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_MODE, 1, &ae);
         ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AWB_MODE, 1, &awb);
@@ -526,14 +673,15 @@ private:
             AImage_getPlaneRowStride(image, 0, &rowStride) != AMEDIA_OK || rowStride <= 0) {
             return {};
         }
-        // RAW10 may report pixelStride=0. RAW16 normally reports 2.
         AImage_getPlanePixelStride(image, 0, &pixelStride);
 
         std::string cacheDir;
+        RawConfig captureConfig;
         {
             std::lock_guard<std::mutex> lock(captureMutex_);
             if (!captureActive_ || captureCacheDir_.empty()) return {};
             cacheDir = captureCacheDir_;
+            captureConfig = rawConfig_;
         }
         std::ostringstream fileName;
         fileName << cacheDir;
@@ -545,7 +693,7 @@ private:
         if (!output.good()) return {};
 
         bool okay = true;
-        if (rawConfig_.format == AIMAGE_FORMAT_RAW16) {
+        if (captureConfig.format == AIMAGE_FORMAT_RAW16) {
             const int stride = pixelStride > 0 ? pixelStride : 2;
             for (int y = 0; y < height && okay; ++y) {
                 const int64_t rowStart = static_cast<int64_t>(y) * rowStride;
@@ -565,7 +713,28 @@ private:
                 }
                 okay = output.good();
             }
-        } else if (rawConfig_.format == AIMAGE_FORMAT_RAW10) {
+        } else if (captureConfig.format == AIMAGE_FORMAT_RAW12) {
+            // Android RAW12 packs two 12-bit pixels into three bytes: 8 MSBs for each pixel,
+            // followed by the low nibbles. Expand to little-endian uint16 samples.
+            for (int y = 0; y < height && okay; ++y) {
+                const int64_t rowStart = static_cast<int64_t>(y) * rowStride;
+                for (int x = 0; x < width; ++x) {
+                    const int group = x / 2;
+                    const int within = x % 2;
+                    const int64_t highOffset = rowStart + static_cast<int64_t>(group) * 3 + within;
+                    const int64_t lowOffset = rowStart + static_cast<int64_t>(group) * 3 + 2;
+                    uint16_t value = 0;
+                    if (highOffset < dataLength && lowOffset < dataLength) {
+                        const uint16_t high = data[highOffset];
+                        const uint16_t packed = data[lowOffset];
+                        const uint16_t low = within == 0 ? (packed & 0x0f) : ((packed >> 4) & 0x0f);
+                        value = static_cast<uint16_t>((high << 4) | low);
+                    }
+                    output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+                }
+                okay = output.good();
+            }
+        } else if (captureConfig.format == AIMAGE_FORMAT_RAW10) {
             for (int y = 0; y < height && okay; ++y) {
                 const int64_t rowStart = static_cast<int64_t>(y) * rowStride;
                 for (int x = 0; x < width; ++x) {
@@ -669,19 +838,16 @@ private:
     }
 
     void stopLocked() {
-        alive_ = false;
+        alive_.store(false);
         {
             std::lock_guard<std::mutex> captureLock(captureMutex_);
             if (captureActive_ && captureError_.empty()) captureError_ = "NDK camera session stopped";
         }
         captureCv_.notify_all();
 
-        if (captureSession_ != nullptr) {
-            ACameraCaptureSession_stopRepeating(captureSession_);
-            ACameraCaptureSession_abortCaptures(captureSession_);
-            ACameraCaptureSession_close(captureSession_);
-            captureSession_ = nullptr;
-        }
+        closeSessionLocked();
+        strategy_ = SessionStrategy::NONE;
+
         if (previewRequest_ != nullptr) {
             ACaptureRequest_free(previewRequest_);
             previewRequest_ = nullptr;
@@ -694,10 +860,6 @@ private:
             ACameraOutputTarget_free(rawTarget_);
             rawTarget_ = nullptr;
         }
-        if (outputContainer_ != nullptr) {
-            if (previewOutput_ != nullptr) ACaptureSessionOutputContainer_remove(outputContainer_, previewOutput_);
-            if (rawOutput_ != nullptr) ACaptureSessionOutputContainer_remove(outputContainer_, rawOutput_);
-        }
         if (previewOutput_ != nullptr) {
             ACaptureSessionOutput_free(previewOutput_);
             previewOutput_ = nullptr;
@@ -705,10 +867,6 @@ private:
         if (rawOutput_ != nullptr) {
             ACaptureSessionOutput_free(rawOutput_);
             rawOutput_ = nullptr;
-        }
-        if (outputContainer_ != nullptr) {
-            ACaptureSessionOutputContainer_free(outputContainer_);
-            outputContainer_ = nullptr;
         }
         rawWindow_ = nullptr;
         if (rawReader_ != nullptr) {
@@ -741,7 +899,7 @@ private:
         AImage* image = nullptr;
         const media_status_t result = AImageReader_acquireNextImage(reader, &image);
         if (result != AMEDIA_OK || image == nullptr) return;
-        if (self->alive_) {
+        if (self->alive_.load()) {
             const std::string path = self->stageImage(image);
             if (path.empty()) {
                 std::lock_guard<std::mutex> lock(self->captureMutex_);
@@ -772,7 +930,7 @@ private:
     static void onPreviewProgressed(void*, ACameraCaptureSession*, ACaptureRequest*, const ACameraMetadata*) {}
     static void onPreviewCompleted(void* context, ACameraCaptureSession*, ACaptureRequest*, const ACameraMetadata* result) {
         auto* self = static_cast<NativeCameraSession*>(context);
-        if (self != nullptr && self->alive_) self->updatePreviewMeta(result);
+        if (self != nullptr && self->alive_.load()) self->updatePreviewMeta(result);
     }
     static void onPreviewFailed(void*, ACameraCaptureSession*, ACaptureRequest*, ACameraCaptureFailure*) {}
     static void onPreviewSequenceCompleted(void*, ACameraCaptureSession*, int, int64_t) {}
@@ -783,7 +941,7 @@ private:
     static void onStillProgressed(void*, ACameraCaptureSession*, ACaptureRequest*, const ACameraMetadata*) {}
     static void onStillCompleted(void* context, ACameraCaptureSession*, ACaptureRequest*, const ACameraMetadata* result) {
         auto* self = static_cast<NativeCameraSession*>(context);
-        if (self != nullptr && self->alive_) self->addStillMeta(result);
+        if (self != nullptr && self->alive_.load()) self->addStillMeta(result);
     }
     static void onStillFailed(void* context, ACameraCaptureSession*, ACaptureRequest*, ACameraCaptureFailure*) {
         auto* self = static_cast<NativeCameraSession*>(context);
@@ -806,9 +964,11 @@ private:
     std::mutex stateMutex_;
     std::mutex captureMutex_;
     std::condition_variable captureCv_;
-    bool alive_ = false;
+    std::atomic<bool> alive_{false};
     bool captureActive_ = false;
     bool captureSequenceDone_ = false;
+    bool containerHasPreview_ = false;
+    bool containerHasRaw_ = false;
     int expectedFrames_ = 0;
     uint64_t stagedCounter_ = 0;
     std::string cameraId_;
@@ -818,6 +978,7 @@ private:
     std::vector<StagedImage> capturedImages_;
     std::map<int64_t, CaptureMeta> capturedMetadata_;
     RawConfig rawConfig_;
+    SessionStrategy strategy_ = SessionStrategy::NONE;
 
     ACameraManager* manager_ = nullptr;
     ACameraMetadata* characteristics_ = nullptr;
