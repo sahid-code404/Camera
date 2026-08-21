@@ -3,7 +3,7 @@ plugins {
 }
 
 android {
-    namespace = "com.camera.camera.camera2"
+    namespace = "com.camera.processing.raw"
     compileSdk = 37
     ndkVersion = "27.2.12479018"
 
@@ -29,9 +29,6 @@ android {
 
 dependencies {
     implementation(project(":core-model"))
-    implementation(project(":camera-api"))
-    implementation(project(":camera-capability"))
-    implementation(libs.androidx.camera.core)
-    implementation(libs.androidx.camera.camera2)
-    implementation(libs.kotlinx.coroutines.android)
+    implementation(project(":processing-api"))
+    implementation(libs.androidx.core.ktx)
 }

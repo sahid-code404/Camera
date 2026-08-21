@@ -43,6 +43,7 @@ data class ValuableLens(
     val sensorWidthMm: Float?,
     val displayZoomAnchor: Float?,
     val rawSupported: Boolean,
+    val nativeRoutePreferred: Boolean = false,
     val userVisible: Boolean = true,
     val userOrder: Int = 0,
     val userName: String? = null,

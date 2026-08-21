@@ -1,27 +1,58 @@
+import java.util.Base64
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
 
+val devKeySource = rootProject.file("ci/dev-update-keystore.b64")
+val devKeyFile = layout.buildDirectory.file("dev-signing/camera-dev-update.jks").get().asFile
+if (devKeySource.exists()) {
+    devKeyFile.parentFile.mkdirs()
+    devKeyFile.writeBytes(Base64.getMimeDecoder().decode(devKeySource.readText()))
+}
+
+val ciBuildNumber = providers.environmentVariable("GITHUB_RUN_NUMBER").orNull?.toIntOrNull() ?: 2
+// Keep development builds far above the earlier run-number-only version codes so a stale
+// pre-Linear-DNG APK can never silently win an update comparison on-device.
+val devVersionCode = 100_000 + ciBuildNumber
+
 android {
-    namespace = "com.camera.app"
+    // Keep the installed app identity aligned with Camera-Computaional.
+    namespace = "com.sahid.camera"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.camera.app"
+        applicationId = "com.sahid.camera"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.0.1-bootstrap"
+        versionCode = devVersionCode
+        versionName = "0.3.0-linear.$ciBuildNumber"
+        buildConfigField(
+            "String",
+            "OTA_MANIFEST_URL",
+            "\"https://raw.githubusercontent.com/sahid-code404/Camera/ota/update.json\"",
+        )
+    }
+
+    signingConfigs {
+        create("devUpdate") {
+            storeFile = devKeyFile
+            storePassword = "camera-dev-only"
+            keyAlias = "camera-dev"
+            keyPassword = "camera-dev-only"
+        }
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
+            // Stable dev signing is required so each CI APK can update over the previous build.
+            signingConfig = signingConfigs.getByName("devUpdate")
             versionNameSuffix = "-debug"
         }
         release {
@@ -42,6 +73,7 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)

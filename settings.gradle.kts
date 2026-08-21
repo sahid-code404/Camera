@@ -23,6 +23,7 @@ include(
     ":camera-capability",
     ":camera-camera2",
     ":processing-api",
+    ":processing-raw",
     ":video-engine",
     ":feature-camera",
     ":feature-settings",

@@ -9,6 +9,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,8 +30,8 @@ jobs:
           cmdline-tools-version: 14742923
           packages: platform-tools
 
-      - name: Install Android SDK
-        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+      - name: Install Android SDK + native toolchain
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
 
       - name: Gradle version
         run: bash ./gradlew --version
@@ -49,3 +52,48 @@ jobs:
           name: camera-phase-debug
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      - name: Publish development OTA channel
+        if: success() && github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_REL="$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' | head -n 1)"
+          test -n "$APK_REL"
+          APK_ABS="$GITHUB_WORKSPACE/$APK_REL"
+          OTA_NAME="Camera-dev-${GITHUB_RUN_NUMBER}.apk"
+          OTA_VERSION_CODE="$((100000 + GITHUB_RUN_NUMBER))"
+          TMP_DIR="$(mktemp -d)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin ota || true
+
+          if git show-ref --verify --quiet refs/remotes/origin/ota; then
+            git worktree add "$TMP_DIR" origin/ota
+            cd "$TMP_DIR"
+            git checkout -B ota origin/ota
+          else
+            git worktree add --detach "$TMP_DIR"
+            cd "$TMP_DIR"
+            git checkout --orphan ota
+            git rm -rf . || true
+          fi
+
+          rm -f Camera-dev-*.apk
+          cp "$APK_ABS" "$OTA_NAME"
+          SHA256="$(sha256sum "$OTA_NAME" | awk '{print $1}')"
+
+          cat > update.json <<EOF
+          {
+            "versionCode": ${OTA_VERSION_CODE},
+            "versionName": "0.3.0-linear.${GITHUB_RUN_NUMBER}-debug",
+            "apkUrl": "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/ota/${OTA_NAME}",
+            "sha256": "${SHA256}"
+          }
+          EOF
+
+          git add -A
+          git commit -m "ota: publish linear dev build ${GITHUB_RUN_NUMBER}"
+          git push origin HEAD:ota
