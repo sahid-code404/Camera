@@ -16,11 +16,19 @@ import com.camera.core.model.ValuableLens
  * The selected lens is validated naturally by the real preview session; successful preview/DNG
  * operations promote the cache from metadata -> SESSION -> RAW.
  */
+suspend fun AndroidCameraCatalog.scanPrimaryValidated(
+    context: Context,
+): CameraCatalogSnapshot = validateMetadata(context, scanPrimaryCameras())
+
 suspend fun AndroidCameraCatalog.scanValidated(
     context: Context,
     deepScan: Boolean = false,
+): CameraCatalogSnapshot = validateMetadata(context, scan(deepScan = deepScan))
+
+private suspend fun validateMetadata(
+    context: Context,
+    metadata: CameraCatalogSnapshot,
 ): CameraCatalogSnapshot {
-    val metadata = scan(deepScan = deepScan)
     val profiles = metadata.deviceProfiles
     if (profiles.isEmpty()) return metadata
 

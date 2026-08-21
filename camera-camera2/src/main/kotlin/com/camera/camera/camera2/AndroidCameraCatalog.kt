@@ -39,6 +39,64 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
 
     override suspend fun scan(): CameraCatalogSnapshot = scan(deepScan = false)
 
+    /**
+     * Critical-path startup scan. Resolve only the first framework-compatible rear and front
+     * cameras, stopping as soon as both are known. This deliberately avoids NDK enumeration,
+     * logical physical-member expansion, and hidden AUX probing so first preview can start with
+     * the least possible camera-service work.
+     */
+    suspend fun scanPrimaryCameras(): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
+        val javaIds = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
+        var firstBack: Pair<String, CameraCharacteristics>? = null
+        var firstFront: Pair<String, CameraCharacteristics>? = null
+        var firstCompatible: Pair<String, CameraCharacteristics>? = null
+
+        for (id in javaIds) {
+            val chars = runCatching { manager.getCameraCharacteristics(id) }.getOrNull() ?: continue
+            val capabilities = chars
+                .get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.toSet()
+                .orEmpty()
+            if (CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE !in capabilities) {
+                continue
+            }
+            if (firstCompatible == null) firstCompatible = id to chars
+            when (facingOf(chars.get(CameraCharacteristics.LENS_FACING))) {
+                LensFacing.BACK -> if (firstBack == null) firstBack = id to chars
+                LensFacing.FRONT -> if (firstFront == null) firstFront = id to chars
+                else -> Unit
+            }
+            if (firstBack != null && firstFront != null) break
+        }
+
+        val selected = buildList {
+            firstBack?.let(::add)
+            firstFront?.let { front -> if (none { it.first == front.first }) add(front) }
+            if (isEmpty()) firstCompatible?.let(::add)
+        }
+        val profiles = selected.map { (id, chars) ->
+            buildJavaProfile(
+                routeCameraId = id,
+                physicalCameraId = null,
+                parentLogicalCameraId = null,
+                routeKind = CameraRouteKind.ENUMERATED,
+                characteristics = chars,
+                inheritedFacing = null,
+            )
+        }
+        val resolution = ValuableCameraResolver.resolve(profiles)
+        CameraCatalogSnapshot(
+            deviceProfiles = profiles,
+            valuableLenses = resolution.lenses,
+            diagnosticsJson = diagnosticsJson(
+                profiles = profiles,
+                hidden = resolution.hiddenRouteKeys,
+                javaIds = javaIds,
+                ndkIds = emptyList(),
+            ),
+        )
+    }
+
     suspend fun scan(deepScan: Boolean): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
         val javaIds = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
         val enumerated = javaIds.mapNotNull { id ->
