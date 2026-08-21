@@ -1,6 +1,6 @@
 {
-  "versionCode": 100311,
-  "versionName": "0.3.0-linear.311-debug",
-  "apkUrl": "https://raw.githubusercontent.com/sahid-code404/Camera/ota/Camera-dev-311.apk",
-  "sha256": "907183c4844911c504b91b61b08289b464e449f6dcc94cdaa53cef7a0b2c7308"
+  "versionCode": 100313,
+  "versionName": "0.3.0-linear.313-debug",
+  "apkUrl": "https://raw.githubusercontent.com/sahid-code404/Camera/ota/Camera-dev-313.apk",
+  "sha256": "b98fad059b141e895c99708f92c00fc4825d310bd13f35b274adbdc0d77b04b2"
 }
