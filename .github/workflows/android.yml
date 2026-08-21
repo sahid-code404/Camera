@@ -20,10 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: phase/01-foundation-discovery
           fetch-depth: 0
 
       - name: Apply one-shot lightning startup optimization
-        if: github.event_name == 'push' && github.ref == 'refs/heads/phase/01-foundation-discovery'
+        if: github.event_name == 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
