@@ -3,22 +3,22 @@ package com.camera.camera.camera2
 import android.content.Context
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.api.CameraRouteProbeResult
+import com.camera.camera.api.CameraRouteProbeStatus
 import com.camera.camera.capability.ValuableCameraResolver
 import com.camera.core.model.CameraDeviceProfile
 import com.camera.core.model.ValuableLens
 
 /**
- * Metadata discovery followed by runtime validation of only the routes that can actually become
- * user-facing lenses.
+ * Fast metadata discovery plus runtime validation of routes that can become user-facing lenses.
  *
- * The resolver may have several aliases for one piece of glass (Java direct, logical/physical,
- * NDK vendor route). We probe the preferred route first. If it fails, that route is rejected and
- * the resolver is run again so the next alias can be tried. This keeps startup work bounded to
- * roughly one successful probe per physical lens while still recovering when the nominally
- * preferred Java route cannot really deliver RAW but an NDK route can.
+ * Hot path: when the ROM/HAL camera fingerprint is unchanged, previously verified routes are loaded
+ * from SharedPreferences and the lens graph is resolved immediately. No camera device is opened.
  *
- * Java routes must configure both preview and RAW-only sessions. NDK routes go further and acquire
- * one real RAW frame through the same adaptive native session used by the camera UI.
+ * Cold path: de-duplicate first, then probe only the currently preferred route for each physical
+ * lens. Java physical children that share a logical parent are batch-probed through one open device.
+ * If a preferred route fails, the resolver promotes the next Java/physical/NDK alias and only that
+ * replacement is tested. NDK startup validation is session-only; a real successful photo later
+ * promotes the route to RAW_VERIFIED in the cache.
  */
 suspend fun AndroidCameraCatalog.scanValidated(context: Context): CameraCatalogSnapshot {
     val metadata = scan()
@@ -26,6 +26,32 @@ suspend fun AndroidCameraCatalog.scanValidated(context: Context): CameraCatalogS
     if (profiles.isEmpty()) return metadata
 
     val profileByKey = profiles.associateBy(::routeKey)
+
+    // Lightning-fast normal launch. The fingerprint covers the Android build and all relevant HAL
+    // route/optics/RAW/preview metadata, so a ROM or camera-provider change naturally invalidates it.
+    CameraRouteValidationCache.load(context, profiles)?.let { cached ->
+        val cachedResolution = ValuableCameraResolver.resolve(profiles, cached.allUsableRouteKeys)
+        if (cachedResolution.lenses.isNotEmpty()) {
+            val cachedResults = cached.allUsableRouteKeys.mapNotNull { key ->
+                val profile = profileByKey[key] ?: return@mapNotNull null
+                CameraRouteProbeResult(
+                    routeCameraId = profile.routeCameraId,
+                    physicalCameraId = profile.physicalCameraId,
+                    status = CameraRouteProbeStatus.SESSION_CONFIGURED,
+                    message = when (cached.level(key)) {
+                        CameraRouteValidationCache.TrustLevel.RAW -> "Cached RAW verified"
+                        CameraRouteValidationCache.TrustLevel.SESSION -> "Cached session verified"
+                        null -> "Cached verified route"
+                    },
+                )
+            }
+            return metadata.copy(
+                valuableLenses = cachedResolution.lenses,
+                routeProbeResults = cachedResults,
+            )
+        }
+    }
+
     val allKeys = profileByKey.keys
     val rejectedKeys = mutableSetOf<String>()
     val probeResults = linkedMapOf<String, CameraRouteProbeResult>()
@@ -33,36 +59,53 @@ suspend fun AndroidCameraCatalog.scanValidated(context: Context): CameraCatalogS
 
     AndroidCameraRouteProbe(context).use { javaProbe ->
         val nativeProbe = NativeCameraRouteProbe(context)
-
-        repeat(profiles.size + 1) {
+        var iterations = 0
+        while (iterations++ <= profiles.size) {
             val selectedKeys = resolution.lenses.map(::routeKey)
-            val pending = selectedKeys.filterNot(probeResults::containsKey)
-            if (pending.isEmpty()) return@repeat
+            val pendingKeys = selectedKeys.filterNot(probeResults::containsKey)
+            if (pendingKeys.isEmpty()) break
 
-            pending.forEach { key ->
-                val profile = profileByKey[key] ?: return@forEach
-                val result = if ("NDK_ENUMERATED" in profile.capabilities) {
-                    nativeProbe.probe(profile)
-                } else {
-                    javaProbe.probe(profile)
-                }
-                probeResults[key] = result
-                if (!result.usable) rejectedKeys += key
+            val pendingProfiles = pendingKeys.mapNotNull(profileByKey::get)
+            val javaPending = pendingProfiles.filter { "NDK_ENUMERATED" !in it.capabilities }
+            val nativePending = pendingProfiles.filter { "NDK_ENUMERATED" in it.capabilities }
+
+            // One open per routeCameraId, even when several physical children share the same parent.
+            javaProbe.probeBatch(javaPending).forEach { result ->
+                probeResults[result.routeKey] = result
+                if (!result.usable) rejectedKeys += result.routeKey
             }
 
-            // Unprobed aliases remain candidates. Failed routes do not. If a selected route failed,
-            // this immediately promotes the best remaining alias for the same physical optics.
+            // The native bridge intentionally owns one session at a time. Sequential probing avoids
+            // ERROR_MAX_CAMERAS_IN_USE and false negatives on conservative vendor camera providers.
+            nativePending.forEach { profile ->
+                val result = nativeProbe.probe(profile)
+                probeResults[result.routeKey] = result
+                if (!result.usable) rejectedKeys += result.routeKey
+            }
+
             val candidateKeys = allKeys - rejectedKeys
-            resolution = ValuableCameraResolver.resolve(profiles, candidateKeys)
+            val nextResolution = ValuableCameraResolver.resolve(profiles, candidateKeys)
+            val nextKeys = nextResolution.lenses.map(::routeKey)
+            resolution = nextResolution
+
+            // If nothing changed and every selected route has already been probed, we are done.
+            if (nextKeys.all(probeResults::containsKey)) break
         }
     }
 
-    // Every final user-facing route must have passed a runtime probe. Do not leave an unvalidated
-    // metadata-only camera visible merely because the retry loop exhausted.
+    // Final UI is constructed exclusively from routes that actually passed runtime validation.
     val verifiedKeys = probeResults.values
         .filter { it.usable }
         .mapTo(mutableSetOf()) { it.routeKey }
     val verifiedResolution = ValuableCameraResolver.resolve(profiles, verifiedKeys)
+
+    if (verifiedResolution.lenses.isNotEmpty()) {
+        CameraRouteValidationCache.saveSessionValidated(
+            context = context,
+            profiles = profiles,
+            routeKeys = verifiedResolution.lenses.mapTo(mutableSetOf(), ::routeKey),
+        )
+    }
 
     return metadata.copy(
         valuableLenses = verifiedResolution.lenses,
