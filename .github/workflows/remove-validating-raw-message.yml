@@ -26,8 +26,8 @@ jobs:
           path = Path('feature-camera/src/main/kotlin/com/camera/feature/camera/CameraBootstrapScreen.kt')
           text = path.read_text()
           old = '''        snapshot == null -> {
-              Text("Validating RAW camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
-          }
+            Text("Validating RAW camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
+        }
 '''
           if old not in text:
               raise SystemExit('startup validation message block not found')
