@@ -1,6 +1,6 @@
 {
-  "versionCode": 100220,
-  "versionName": "0.3.0-linear.220-debug",
-  "apkUrl": "https://raw.githubusercontent.com/sahid-code404/Camera/ota/Camera-dev-220.apk",
-  "sha256": "a506aaec8d12c86a94ea18090fc41cdf8969e297effc207e4ef5eba0a0b32548"
+  "versionCode": 100222,
+  "versionName": "0.3.0-linear.222-debug",
+  "apkUrl": "https://raw.githubusercontent.com/sahid-code404/Camera/ota/Camera-dev-222.apk",
+  "sha256": "1efd8ba4125773fdbec16600ee045c47d93303381f94f839f4f3871786d53e3a"
 }
