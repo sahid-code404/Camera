@@ -27,6 +27,7 @@ import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.TextureView
 import android.view.ViewTreeObserver
+import com.camera.camera.camera2.CameraRouteValidationCache
 import com.camera.camera.camera2.NativeCameraNdkBridge
 import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
@@ -281,6 +282,7 @@ internal class Camera2PreviewController(
             },
             onProcessing = { emitCapture(PhotoCaptureState.Saving) },
             onSaved = { uri ->
+                CameraRouteValidationCache.markRawVerified(appContext, lens)
                 handler.post {
                     if (released) return@post
                     captureInFlight = false
@@ -288,6 +290,7 @@ internal class Camera2PreviewController(
                 }
             },
             onError = { message ->
+                markDefinitiveRawFailure(lens, message)
                 handler.post {
                     if (released) return@post
                     captureInFlight = false
@@ -360,6 +363,7 @@ internal class Camera2PreviewController(
                         fused = fused,
                         description = description,
                     )
+                    CameraRouteValidationCache.markRawVerified(appContext, lens)
                     handler.post {
                         if (released) return@post
                         captureInFlight = false
@@ -371,14 +375,12 @@ internal class Camera2PreviewController(
                     fused.file.delete()
                 }
             } catch (error: Throwable) {
+                val message = error.message ?: "Native auxiliary RAW capture failed"
+                markDefinitiveRawFailure(lens, message)
                 handler.post {
                     if (released) return@post
                     captureInFlight = false
-                    emitCapture(
-                        PhotoCaptureState.Error(
-                            error.message ?: "Native auxiliary RAW capture failed",
-                        ),
-                    )
+                    emitCapture(PhotoCaptureState.Error(message))
                 }
             } finally {
                 stagedFiles.forEach { runCatching { it.delete() } }
@@ -556,6 +558,7 @@ internal class Camera2PreviewController(
         val error = NativeCameraNdkBridge.startSession(lens.cameraId, surface)
         opening = false
         if (error != null) {
+            markDefinitiveRawFailure(lens, error)
             nativeSessionActive = false
             runCatching { surface.release() }
             if (previewSurface === surface) previewSurface = null
@@ -571,6 +574,7 @@ internal class Camera2PreviewController(
             return
         }
         nativeSessionActive = true
+        CameraRouteValidationCache.markSessionValidated(appContext, lens)
         currentZoomRatio = 1f
         maxZoomRatio = 1f
         emitZoom(ZoomState(1f, 1f))
@@ -585,8 +589,9 @@ internal class Camera2PreviewController(
     }
 
     private fun nativeDescriptorFor(lens: ValuableLens): NativeCameraNdkBridge.Descriptor? {
-        if (lens.physicalCameraId != null || lens.cameraId in javaCameraIds) return null
-        return NativeCameraNdkBridge.descriptor(lens.cameraId)
+        if (lens.physicalCameraId != null) return null
+        val descriptor = NativeCameraNdkBridge.descriptor(lens.cameraId) ?: return null
+        return descriptor.takeIf { lens.nativeRoutePreferred || lens.cameraId !in javaCameraIds }
     }
 
     private fun handleRecoverableCameraLoss(camera: CameraDevice, lens: ValuableLens) {
@@ -655,6 +660,7 @@ internal class Camera2PreviewController(
                         override fun onConfigureFailed(session: CameraCaptureSession) {
                             session.close()
                             if (captureSession === session) captureSession = null
+                            CameraRouteValidationCache.markRejected(appContext, lens)
                             emit(
                                 PreviewState.Error(
                                     if (lens.physicalCameraId != null) {
@@ -694,6 +700,7 @@ internal class Camera2PreviewController(
             }
             previewBuilder = builder
             session.setRepeatingRequest(builder.build(), previewCaptureCallback, handler)
+            CameraRouteValidationCache.markSessionValidated(appContext, lens)
             emit(
                 PreviewState.Streaming(
                     lens.cameraId,
@@ -871,6 +878,20 @@ internal class Camera2PreviewController(
             runCatching { cameraManager.getCameraCharacteristics(id) }.getOrNull()?.let { return it }
         }
         return cameraManager.getCameraCharacteristics(lens.cameraId)
+    }
+
+    private fun markDefinitiveRawFailure(lens: ValuableLens, message: String) {
+        val value = message.lowercase()
+        val definitive = listOf(
+            "no genuine raw",
+            "no raw_sensor",
+            "rejected raw",
+            "raw_sensor routing",
+            "unsupported bayer",
+            "raw image reader",
+            "raw output",
+        ).any(value::contains)
+        if (definitive) CameraRouteValidationCache.markRejected(appContext, lens)
     }
 
     private fun closeCamera() {

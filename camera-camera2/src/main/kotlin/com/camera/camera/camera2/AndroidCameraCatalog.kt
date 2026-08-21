@@ -37,7 +37,9 @@ import org.json.JSONObject
 class AndroidCameraCatalog(context: Context) : CameraCatalog {
     private val manager = context.applicationContext.getSystemService(CameraManager::class.java)
 
-    override suspend fun scan(): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
+    override suspend fun scan(): CameraCatalogSnapshot = scan(deepScan = false)
+
+    suspend fun scan(deepScan: Boolean): CameraCatalogSnapshot = withContext(Dispatchers.Default) {
         val javaIds = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())
         val enumerated = javaIds.mapNotNull { id ->
             runCatching {
@@ -52,8 +54,29 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
             }.getOrNull()
         }
 
+        val ndkDescriptors = NativeCameraNdkBridge.enumerateRawCameras(deepScan = deepScan)
+        val ndkById = ndkDescriptors.associateBy { it.id }
+        val enrichedEnumerated = enumerated.map { profile ->
+            val native = ndkById[profile.routeCameraId]
+            when {
+                native == null -> profile
+                profile.streams.rawSizes.isEmpty() -> profile.copy(
+                    streams = profile.streams.copy(
+                        rawSizes = listOf(PixelSize(native.rawWidth, native.rawHeight)),
+                    ),
+                    capabilities = profile.capabilities + setOf("NDK_RAW_ALIAS", "NDK_RAW_PREFERRED"),
+                    supportsRaw = true,
+                    discoveryWarnings = profile.discoveryWarnings +
+                        "Java route has no RAW_SENSOR map; NDK RAW transport preferred",
+                )
+                else -> profile.copy(
+                    capabilities = profile.capabilities + "NDK_RAW_ALIAS",
+                )
+            }
+        }
+
         val physicalMembers = buildList {
-            enumerated.forEach { parent ->
+            enrichedEnumerated.forEach { parent ->
                 parent.logicalPhysicalIds.forEach physical@ { physicalId ->
                     val chars = runCatching { manager.getCameraCharacteristics(physicalId) }.getOrNull()
                         ?: return@physical
@@ -65,15 +88,27 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
                         characteristics = chars,
                         inheritedFacing = parent.facing,
                     )
+                    val childHadNoPhotoStreams = child.maxPhotoPixels == 0L
 
                     // API 29+ physical cameras may omit a standalone stream configuration map while
                     // still being routable through the logical parent. Preserve the parent's stream
                     // declarations as candidates and let the real session decide whether that
                     // physical route works.
-                    if (child.maxPhotoPixels == 0L && parent.maxPhotoPixels > 0L) {
+                    val parentHasFrameworkRaw =
+                        parent.streams.rawSizes.isNotEmpty() &&
+                            "NDK_RAW_PREFERRED" !in parent.capabilities
+                    if (child.streams.rawSizes.isEmpty() && parentHasFrameworkRaw) {
+                        child = child.copy(
+                            streams = child.streams.copy(rawSizes = parent.streams.rawSizes),
+                            supportsRaw = true,
+                            discoveryWarnings = child.discoveryWarnings +
+                                "Inherited logical-parent RAW_SENSOR candidates",
+                        )
+                    }
+                    if (childHadNoPhotoStreams && parent.maxPhotoPixels > 0L) {
                         child = child.copy(
                             streams = parent.streams,
-                            supportsRaw = child.supportsRaw || parent.streams.rawSizes.isNotEmpty(),
+                            supportsRaw = child.supportsRaw || parentHasFrameworkRaw,
                             discoveryWarnings = child.discoveryWarnings +
                                 "Inherited logical-parent stream candidates",
                         )
@@ -83,17 +118,17 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
             }
         }
 
-        val javaRouteKeys = (enumerated + physicalMembers)
+        val javaRouteKeys = (enrichedEnumerated + physicalMembers)
             .mapTo(mutableSetOf()) { routeKey(it) }
 
         // MotionCam-style path. Unlike Java CameraManager.getCameraIdList(), the NDK client can see
-        // auxiliary IDs on a number of Qualcomm vendor frameworks. Keep only IDs that report RAW
-        // plus an actual RAW10/RAW16 output configuration.
-        val ndkProfiles = NativeCameraNdkBridge.enumerateRawCameras()
+        // auxiliary IDs on a number of Qualcomm vendor frameworks. Keep only IDs with a genuine
+        // RAW10/RAW12/RAW16 stream. Deep scan is metadata-only and never opens camera devices.
+        val ndkProfiles = ndkDescriptors
             .map(::buildNdkProfile)
             .filterNot { routeKey(it) in javaRouteKeys }
 
-        val profiles = (enumerated + physicalMembers + ndkProfiles)
+        val profiles = (enrichedEnumerated + physicalMembers + ndkProfiles)
             .distinctBy(::routeKey)
 
         val resolution = ValuableCameraResolver.resolve(profiles)
@@ -216,6 +251,7 @@ class AndroidCameraCatalog(context: Context) : CameraCatalog {
                 if (item.manualSensor) add("MANUAL_SENSOR")
                 if (item.burstCapture) add("BURST_CAPTURE")
                 add("NDK_ENUMERATED")
+                add("NDK_RAW_PREFERRED")
             },
             focalLengthsMm = item.focalLengthMm?.let(::listOf).orEmpty(),
             sensorWidthMm = item.sensorWidthMm,

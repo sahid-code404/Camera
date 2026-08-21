@@ -146,6 +146,9 @@ object ValuableCameraResolver {
                             sensorWidthMm = profile.sensorWidthMm,
                             displayZoomAnchor = anchor,
                             rawSupported = routeKey(profile) in rawRouteKeys,
+                            nativeRoutePreferred =
+                                "NDK_ENUMERATED" in profile.capabilities ||
+                                    "NDK_RAW_PREFERRED" in profile.capabilities,
                         ),
                     )
                 }

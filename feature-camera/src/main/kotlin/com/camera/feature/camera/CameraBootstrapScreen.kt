@@ -130,12 +130,18 @@ fun CameraBootstrapScreen() {
     LaunchedEffect(cameraPermissionGranted) {
         if (!cameraPermissionGranted) return@LaunchedEffect
         discoveryError = null
-        // Do not expose metadata-only camera IDs. The validated scan probes the preferred route for
-        // each physical lens and falls back across Java/physical/NDK aliases until a real preview +
-        // genuine RAW path is verified.
-        runCatching { catalog.scanValidated(context) }
-            .onSuccess { snapshot = it }
+        // Fast path is metadata-only: never serially open/configure every camera before the UI.
+        // Real preview/capture validates a route lazily and persists that result. After first render,
+        // perform a bounded metadata-only NDK deep scan to discover vendor-hidden numeric AUX IDs.
+        val fast = runCatching { catalog.scanValidated(context, deepScan = false) }
             .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
+            .getOrNull()
+        if (fast != null) {
+            snapshot = fast
+            kotlinx.coroutines.yield()
+            runCatching { catalog.scanValidated(context, deepScan = true) }
+                .onSuccess { deep -> snapshot = deep }
+        }
     }
 
     LaunchedEffect(snapshot?.valuableLenses) {

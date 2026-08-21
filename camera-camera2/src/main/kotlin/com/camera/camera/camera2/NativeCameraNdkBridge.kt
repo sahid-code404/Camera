@@ -71,12 +71,18 @@ object NativeCameraNdkBridge {
     @Volatile
     private var descriptorCache: List<Descriptor>? = null
 
+    @Volatile
+    private var deepScanComplete = false
+
     val available: Boolean get() = loaded
 
-    fun enumerateRawCameras(refresh: Boolean = false): List<Descriptor> {
+    fun enumerateRawCameras(
+        refresh: Boolean = false,
+        deepScan: Boolean = false,
+    ): List<Descriptor> {
         if (!loaded) return emptyList()
-        if (!refresh) descriptorCache?.let { return it }
-        val raw = runCatching { nativeEnumerateJson() }.getOrNull().orEmpty()
+        if (!refresh && (!deepScan || deepScanComplete)) descriptorCache?.let { return it }
+        val raw = runCatching { nativeEnumerateJson(deepScan) }.getOrNull().orEmpty()
         if (raw.isBlank()) return emptyList()
         val parsed = runCatching {
             val array = JSONArray(raw)
@@ -124,8 +130,13 @@ object NativeCameraNdkBridge {
                 }
             }
         }.getOrDefault(emptyList())
-        descriptorCache = parsed
-        return parsed
+        val merged = (descriptorCache.orEmpty() + parsed)
+            .associateBy { it.id }
+            .values
+            .toList()
+        descriptorCache = merged
+        if (deepScan) deepScanComplete = true
+        return merged
     }
 
     fun descriptor(cameraId: String): Descriptor? =
@@ -225,7 +236,7 @@ object NativeCameraNdkBridge {
     private fun JSONObject.optPositiveFloat(key: String): Float? =
         optDouble(key, 0.0).toFloat().takeIf { it.isFinite() && it > 0f }
 
-    private external fun nativeEnumerateJson(): String
+    private external fun nativeEnumerateJson(deepScan: Boolean): String
     private external fun nativeStartSession(cameraId: String, previewSurface: Surface): String
     private external fun nativeStopSession()
     private external fun nativeCaptureBurst(cacheDir: String, frameCount: Int, hdrStrength: Float): String

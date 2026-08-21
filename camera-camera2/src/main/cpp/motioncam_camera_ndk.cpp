@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <set>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -94,7 +96,7 @@ std::vector<SizePair> streamSizes(const ACameraMetadata* metadata, int wantedFor
 SizePair chooseRaw(const ACameraMetadata* metadata) {
     // Prefer unpacked RAW16. RAW12 and RAW10 are also genuine Bayer sensor outputs and are unpacked
     // into 16-bit samples by the native capture path before computational processing.
-    for (const int format : {AIMAGE_FORMAT_RAW16, AIMAGE_FORMAT_RAW12, AIMAGE_FORMAT_RAW10}) {
+    for (const int format : {AIMAGE_FORMAT_RAW10, AIMAGE_FORMAT_RAW16, AIMAGE_FORMAT_RAW12}) {
         auto sizes = streamSizes(metadata, format);
         if (!sizes.empty()) return sizes.front();
     }
@@ -230,7 +232,7 @@ std::string describeCamera(ACameraManager* manager, const char* cameraId) {
     return out.str();
 }
 
-std::string enumerateJson() {
+std::string enumerateJson(bool deepScan) {
     ACameraManager* managerRaw = ACameraManager_create();
     if (managerRaw == nullptr) return "[]";
     std::unique_ptr<ACameraManager, decltype(&ACameraManager_delete)> manager(managerRaw, ACameraManager_delete);
@@ -241,14 +243,38 @@ std::string enumerateJson() {
     }
     std::unique_ptr<ACameraIdList, void(*)(ACameraIdList*)> idList(idListRaw, ACameraManager_deleteCameraIdList);
 
+    std::vector<std::string> candidates;
+    std::set<std::string> seen;
+    int maxNumeric = -1;
+    for (int i = 0; i < idList->numCameras; ++i) {
+        const char* id = idList->cameraIds[i];
+        if (id == nullptr || *id == '\0') continue;
+        const std::string value(id);
+        if (seen.insert(value).second) candidates.push_back(value);
+        char* endPtr = nullptr;
+        const long numeric = std::strtol(value.c_str(), &endPtr, 10);
+        if (endPtr != value.c_str() && endPtr != nullptr && *endPtr == '\0' && numeric >= 0 && numeric <= 128) {
+            maxNumeric = std::max(maxNumeric, static_cast<int>(numeric));
+        }
+    }
+
+    if (deepScan) {
+        // This pass is deliberately metadata-only: no camera is opened. Scan a bounded numeric
+        // namespace so Qualcomm/vendor IDs filtered from both Java and the advertised NDK list can
+        // still be found without device-specific hard-coded IDs. It runs after the first UI render.
+        const int upper = std::min(31, std::max(11, maxNumeric + 8));
+        for (int id = 0; id <= upper; ++id) {
+            const std::string value = std::to_string(id);
+            if (seen.insert(value).second) candidates.push_back(value);
+        }
+    }
+
     std::ostringstream out;
     out << '[';
     bool first = true;
     int rawCount = 0;
-    for (int i = 0; i < idList->numCameras; ++i) {
-        const char* id = idList->cameraIds[i];
-        if (id == nullptr) continue;
-        const std::string description = describeCamera(manager.get(), id);
+    for (const auto& id : candidates) {
+        const std::string description = describeCamera(manager.get(), id.c_str());
         if (description.empty()) continue;
         if (!first) out << ',';
         first = false;
@@ -259,15 +285,17 @@ std::string enumerateJson() {
     __android_log_print(
         ANDROID_LOG_INFO,
         TAG,
-        "NDK discovery enumerated %d IDs and retained %d genuine RAW routes",
+        "NDK discovery advertised=%d candidates=%zu deep=%d retainedRAW=%d",
         idList->numCameras,
+        candidates.size(),
+        deepScan ? 1 : 0,
         rawCount);
     return out.str();
 }
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_camera_camera_camera2_NativeCameraNdkBridge_nativeEnumerateJson(JNIEnv* env, jobject) {
-    const std::string json = enumerateJson();
+Java_com_camera_camera_camera2_NativeCameraNdkBridge_nativeEnumerateJson(JNIEnv* env, jobject, jboolean deepScan) {
+    const std::string json = enumerateJson(deepScan == JNI_TRUE);
     return env->NewStringUTF(json.c_str());
 }

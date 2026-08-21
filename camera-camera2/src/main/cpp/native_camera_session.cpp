@@ -123,7 +123,7 @@ bool chooseRawConfig(const ACameraMetadata* metadata, RawConfig* config) {
 
     // Stream presence is stronger evidence than the redundant RAW capability bit on some vendor
     // physical-camera blocks. Prefer unpacked RAW16, then RAW12, then RAW10.
-    for (const int wanted : {AIMAGE_FORMAT_RAW16, AIMAGE_FORMAT_RAW12, AIMAGE_FORMAT_RAW10}) {
+    for (const int wanted : {AIMAGE_FORMAT_RAW10, AIMAGE_FORMAT_RAW16, AIMAGE_FORMAT_RAW12}) {
         Candidate formatBest{0, 0, 0, 0};
         for (uint32_t i = 0; i + 3 < streams.count; i += 4) {
             const int format = streams.data.i32[i];
