@@ -4,6 +4,7 @@ import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
@@ -33,6 +34,11 @@ import kotlin.math.pow
  *
  * Full-frame pixel processing is native C++ in :processing-raw. Android Camera2 is used only to
  * obtain genuine RAW_SENSOR buffers and matching capture metadata.
+ *
+ * Physical auxiliary cameras are allowed to use a RAW stream configuration exposed by their
+ * logical parent. The ImageReader is still RAW_SENSOR and OutputConfiguration.setPhysicalCameraId()
+ * routes that RAW surface to the selected physical sensor. If the HAL rejects that combination,
+ * capture fails explicitly rather than falling back to JPEG/YUV.
  */
 internal class ComputationalRawCaptureCoordinator(
     context: android.content.Context,
@@ -40,21 +46,18 @@ internal class ComputationalRawCaptureCoordinator(
     private val imageHandler: Handler,
 ) {
     private val appContext = context.applicationContext
+    private val cameraManager = appContext.getSystemService(CameraManager::class.java)
     private val executor = Executor { command -> cameraHandler.post(command) }
     private val scratchDir = File(appContext.cacheDir, "computational-raw")
     private var generation = 0L
     private var active: BurstState? = null
 
     fun supports(characteristics: CameraCharacteristics): Boolean {
-        // Several Qualcomm/Xiaomi physical-camera characteristic blocks publish legitimate
-        // RAW_SENSOR output sizes but omit REQUEST_AVAILABLE_CAPABILITIES_RAW. The concrete stream
-        // map is the stronger routing signal, while createCaptureSession remains the final HAL
-        // validation. Never synthesize RAW from JPEG/YUV.
-        val rawSizes = characteristics
-            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(ImageFormat.RAW_SENSOR)
-            .orEmpty()
-        return rawSizes.isNotEmpty()
+        // PHOTO lens eligibility is already decided by the route-aware catalog. A physical member
+        // can legitimately have no standalone RAW stream map while its logical parent owns the RAW
+        // stream that will be assigned to this physical camera. The real session is validated in
+        // capture(); never synthesize RAW from a processed stream.
+        return true
     }
 
     fun capture(
@@ -79,11 +82,17 @@ internal class ComputationalRawCaptureCoordinator(
             }
             ?.forEach { runCatching { it.delete() } }
 
-        val rawSize = chooseRawSize(captureCharacteristics)
+        val rawStreamCharacteristics = resolveRawStreamCharacteristics(lens, captureCharacteristics)
+        val rawSize = chooseRawSize(rawStreamCharacteristics)
             ?: run {
-                onError("Selected lens exposes no RAW_SENSOR size")
+                onError("Selected lens and logical parent expose no RAW_SENSOR size")
                 return
             }
+        val sensorCharacteristics = chooseSensorMetadataCharacteristics(
+            preferred = captureCharacteristics,
+            fallback = rawStreamCharacteristics,
+        )
+
         val myGeneration = ++generation
         val reader = ImageReader.newInstance(
             rawSize.width,
@@ -94,7 +103,7 @@ internal class ComputationalRawCaptureCoordinator(
         val state = BurstState(
             generation = myGeneration,
             lens = lens,
-            characteristics = captureCharacteristics,
+            characteristics = sensorCharacteristics,
             settings = settings,
             targetAspect = targetAspect.takeIf { it.isFinite() && it > 0f } ?: 4f / 3f,
             reader = reader,
@@ -217,7 +226,14 @@ internal class ComputationalRawCaptureCoordinator(
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     session.close()
-                    fail(state, "Camera rejected RAW capture session")
+                    fail(
+                        state,
+                        if (lens.physicalCameraId != null) {
+                            "HAL rejected RAW_SENSOR routing to physical lens ${lens.physicalCameraId}"
+                        } else {
+                            "Camera rejected RAW capture session"
+                        },
+                    )
                 }
             },
         )
@@ -229,7 +245,16 @@ internal class ComputationalRawCaptureCoordinator(
         }, RAW_TIMEOUT_MS)
 
         runCatching { camera.createCaptureSession(config) }
-            .onFailure { error -> fail(state, error.message ?: "Unable to create RAW session") }
+            .onFailure { error ->
+                fail(
+                    state,
+                    error.message ?: if (lens.physicalCameraId != null) {
+                        "Unable to create physical RAW_SENSOR session"
+                    } else {
+                        "Unable to create RAW session"
+                    },
+                )
+            }
     }
 
     fun cancel() = cancel(notify = false)
@@ -434,6 +459,26 @@ internal class ComputationalRawCaptureCoordinator(
 
     private fun isActive(state: BurstState): Boolean =
         active === state && state.generation == generation
+
+    private fun resolveRawStreamCharacteristics(
+        lens: ValuableLens,
+        preferred: CameraCharacteristics,
+    ): CameraCharacteristics {
+        if (chooseRawSize(preferred) != null) return preferred
+        return runCatching { cameraManager.getCameraCharacteristics(lens.cameraId) }
+            .getOrNull()
+            ?.takeIf { chooseRawSize(it) != null }
+            ?: preferred
+    }
+
+    private fun chooseSensorMetadataCharacteristics(
+        preferred: CameraCharacteristics,
+        fallback: CameraCharacteristics,
+    ): CameraCharacteristics {
+        val cfa = preferred.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+        val white = preferred.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)
+        return if (cfa != null && white != null) preferred else fallback
+    }
 
     private fun chooseRawSize(characteristics: CameraCharacteristics): Size? =
         characteristics
