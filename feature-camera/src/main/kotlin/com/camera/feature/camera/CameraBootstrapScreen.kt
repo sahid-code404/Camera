@@ -49,6 +49,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.camera.camera.api.CameraCatalogSnapshot
 import com.camera.camera.camera2.AndroidCameraCatalog
+import com.camera.camera.camera2.scanValidated
 import com.camera.core.model.LensFacing
 import com.camera.core.model.PhotoLensSettings
 import com.camera.core.model.ValuableLens
@@ -129,7 +130,10 @@ fun CameraBootstrapScreen() {
     LaunchedEffect(cameraPermissionGranted) {
         if (!cameraPermissionGranted) return@LaunchedEffect
         discoveryError = null
-        runCatching { catalog.scan() }
+        // Do not expose metadata-only camera IDs. The validated scan probes the preferred route for
+        // each physical lens and falls back across Java/physical/NDK aliases until a real preview +
+        // genuine RAW path is verified.
+        runCatching { catalog.scanValidated(context) }
             .onSuccess { snapshot = it }
             .onFailure { discoveryError = it.message ?: it.javaClass.simpleName }
     }
@@ -498,7 +502,7 @@ private fun CameraStatus(
             Text("Native DNG processing…", color = Color.White.copy(alpha = 0.86f), fontSize = 12.sp)
         }
         snapshot == null -> {
-            Text("Scanning camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
+            Text("Validating RAW camera hardware…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
         }
         previewState is PreviewState.Opening -> {
             Text("Opening camera…", color = Color.White.copy(alpha = 0.86f), fontSize = 13.sp)
