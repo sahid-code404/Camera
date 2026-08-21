@@ -3,34 +3,29 @@ package com.camera.camera.camera2
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.ImageFormat
-import android.media.ImageReader
-import android.os.Handler
-import android.os.HandlerThread
+import android.graphics.SurfaceTexture
+import android.view.Surface
 import com.camera.camera.api.CameraRouteProbe
 import com.camera.camera.api.CameraRouteProbeResult
 import com.camera.camera.api.CameraRouteProbeStatus
 import com.camera.core.model.CameraDeviceProfile
-import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Strong runtime validation for NDK-only auxiliary cameras.
+ * Lightweight runtime validation for NDK-only auxiliary cameras.
  *
- * Metadata enumeration is not enough: vendor aliases can advertise RAW yet reject the actual
- * preview/RAW combination. This probe starts the same adaptive native session used by the UI and
- * acquires one genuine RAW frame. Only routes that pass both operations are allowed into the
- * validated user-facing lens set.
+ * Startup must prove that the native camera can actually be opened and negotiate the same session
+ * policy used by the UI, but it should not transfer a multi-megabyte Bayer frame just to populate
+ * the lens row. A successful real photo capture later promotes this route to RAW_VERIFIED in the
+ * persistent validation cache.
  *
- * The probe preview uses a small PRIVATE ImageReader and continuously drains it. A detached
- * SurfaceTexture can fill its buffer queue when nobody consumes frames, which can make a perfectly
- * valid camera appear to stall during a RAW probe. Draining the PRIVATE reader avoids that false
- * negative without ever reading or processing preview pixels.
+ * NativeCameraNdkBridge.startSession() already performs adaptive session negotiation: it first
+ * attempts preview+RAW together and falls back to preview-only for HALs that require a RAW-only
+ * shutter session. RAW metadata itself came from a genuine RAW10/RAW12/RAW16 stream declaration.
  */
 class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
     private val appContext = context.applicationContext
-    private val scratchDir = File(appContext.cacheDir, "native-route-probe")
 
     override suspend fun probe(profile: CameraDeviceProfile): CameraRouteProbeResult = withContext(Dispatchers.IO) {
         if (appContext.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -47,30 +42,12 @@ class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
                 "No NDK RAW descriptor",
             )
 
-        scratchDir.mkdirs()
-        scratchDir.listFiles()?.forEach { runCatching { it.delete() } }
-        val drainThread = HandlerThread("NativeRouteProbeDrain").apply { start() }
-        val reader = runCatching {
-            ImageReader.newInstance(
-                descriptor.previewWidth,
-                descriptor.previewHeight,
-                ImageFormat.PRIVATE,
-                PREVIEW_BUFFERS,
-            )
-        }.getOrElse { error ->
-            drainThread.quitSafely()
-            return@withContext result(
-                profile,
-                CameraRouteProbeStatus.NO_PROBE_STREAM,
-                error.message ?: "Unable to create native preview probe target",
-            )
+        val texture = SurfaceTexture(false).apply {
+            setDefaultBufferSize(descriptor.previewWidth, descriptor.previewHeight)
         }
-        reader.setOnImageAvailableListener({ source ->
-            runCatching { source.acquireLatestImage()?.close() }
-        }, Handler(drainThread.looper))
-
+        val surface = Surface(texture)
         try {
-            val startError = NativeCameraNdkBridge.startSession(profile.routeCameraId, reader.surface)
+            val startError = NativeCameraNdkBridge.startSession(profile.routeCameraId, surface)
             if (startError != null) {
                 val status = if (startError.contains("open", ignoreCase = true)) {
                     CameraRouteProbeStatus.OPEN_FAILED
@@ -80,38 +57,22 @@ class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
                 return@withContext result(profile, status, startError)
             }
 
-            val burst = try {
-                NativeCameraNdkBridge.captureBurst(
-                    scratchDirectory = scratchDir,
-                    frameCount = 1,
-                    hdrStrength = 0f,
-                )
-            } catch (error: Throwable) {
-                return@withContext result(
-                    profile,
-                    CameraRouteProbeStatus.SESSION_FAILED,
-                    error.message ?: "Native RAW probe capture failed",
-                )
-            }
-            burst.frames.forEach { runCatching { it.file.delete() } }
             result(
                 profile,
                 CameraRouteProbeStatus.SESSION_CONFIGURED,
                 buildString {
-                    append("NDK RAW verified ")
+                    append("Fast NDK session verified · RAW ")
                     append(descriptor.rawWidth)
                     append('×')
                     append(descriptor.rawHeight)
-                    append(" · ")
-                    append(burst.captureStrategy)
+                    append(" · format=")
+                    append(descriptor.rawFormat)
                 },
             )
         } finally {
             NativeCameraNdkBridge.stopSession()
-            runCatching { reader.setOnImageAvailableListener(null, null) }
-            runCatching { reader.close() }
-            drainThread.quitSafely()
-            scratchDir.listFiles()?.forEach { runCatching { it.delete() } }
+            runCatching { surface.release() }
+            runCatching { texture.release() }
         }
     }
 
@@ -125,8 +86,4 @@ class NativeCameraRouteProbe(context: Context) : CameraRouteProbe {
         status = status,
         message = message,
     )
-
-    private companion object {
-        const val PREVIEW_BUFFERS = 3
-    }
 }
