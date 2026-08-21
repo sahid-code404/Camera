@@ -157,7 +157,14 @@ object NativeCameraNdkBridge {
     ): RawBurst {
         check(loaded) { "Android NDK camera backend is unavailable" }
         scratchDirectory.mkdirs()
-        val requestedFrames = if (frameCount <= 0) 0 else frameCount.coerceIn(1, 8)
+        // The current camera controller historically requested exactly four NDK frames. Treat that
+        // legacy value as the new adaptive policy so existing call sites immediately gain 4..8
+        // light-aware sampling; the runtime route probe deliberately requests one frame and remains
+        // fixed/cheap. Explicit non-legacy counts (2,3,5..8) are still honored exactly.
+        val requestedFrames = when {
+            frameCount <= 0 || frameCount == LEGACY_FIXED_BURST_COUNT -> 0
+            else -> frameCount.coerceIn(1, 8)
+        }
         val raw = nativeCaptureBurst(
             scratchDirectory.absolutePath,
             requestedFrames,
@@ -222,4 +229,6 @@ object NativeCameraNdkBridge {
     private external fun nativeStartSession(cameraId: String, previewSurface: Surface): String
     private external fun nativeStopSession()
     private external fun nativeCaptureBurst(cacheDir: String, frameCount: Int, hdrStrength: Float): String
+
+    private const val LEGACY_FIXED_BURST_COUNT = 4
 }
