@@ -71,6 +71,41 @@ class NdkAliasDedupTest {
     }
 
     @Test
+    fun validatedNdkAliasCanReplaceFailedPreferredJavaRoute() {
+        val javaRoute = profile(
+            id = "0",
+            facing = LensFacing.BACK,
+            focal = 4.74f,
+            sensorWidth = 6.40f,
+            sensorHeight = 4.80f,
+            activeWidth = 4000,
+            activeHeight = 3000,
+            rawSize = PixelSize(4000, 3000),
+        )
+        val ndkAlias = profile(
+            id = "20",
+            facing = LensFacing.BACK,
+            focal = 4.74f,
+            sensorWidth = 6.40f,
+            sensorHeight = 4.80f,
+            activeWidth = 4000,
+            activeHeight = 3000,
+            rawSize = PixelSize(3992, 2992),
+            capabilities = setOf("RAW", "BACKWARD_COMPATIBLE", "NDK_ENUMERATED"),
+        )
+
+        val result = ValuableCameraResolver.resolve(
+            profiles = listOf(javaRoute, ndkAlias),
+            validatedRouteKeys = setOf("20:direct"),
+        )
+
+        assertEquals(1, result.lenses.size)
+        assertEquals("20", result.lenses.single().cameraId)
+        assertTrue(result.lenses.single().rawSupported)
+        assertTrue("0:direct" in result.hiddenRouteKeys)
+    }
+
+    @Test
     fun genuinelyNdkOnlyAuxLensIsStillKept() {
         val main = profile(
             id = "0",
